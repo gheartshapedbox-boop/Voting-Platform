@@ -1,38 +1,54 @@
-import fs from 'node:fs';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { adminRoutes } from './routes/admin.js';
+import { DEFAULT_SESSION_ID, getDb } from './db/index.js';
+import { createStore } from './store.js';
 import { publicRoutes } from './routes/public.js';
+import { adminRoutes } from './routes/admin.js';
+import { AppError } from './errors.js';
+import { DEFAULT_PASSCODE, adminPasscode } from './auth.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const clientDist = path.join(here, '..', 'client', 'dist');
+const CLIENT_DIST = path.resolve(here, '../client/dist');
 
-export function createApp(db) {
+export function createApp({ store, sessionId = DEFAULT_SESSION_ID, serveClient = true } = {}) {
   const app = express();
-  app.set('trust proxy', true);
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '64kb' }));
 
-  app.get('/api/health', (req, res) => res.json({ ok: true }));
-  app.use('/api/admin', adminRoutes(db));
-  app.use('/api', publicRoutes(db));
+  // One store instance per request, resolved lazily so a cold serverless
+  // invocation opens the database once and warm ones reuse it.
+  app.use(async (req, _res, next) => {
+    try {
+      req.store = store ?? createStore(await getDb());
+      next();
+    } catch (err) {
+      next(err);
+    }
+  });
 
-  app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, usingDefaultPasscode: adminPasscode() === DEFAULT_PASSCODE });
+  });
 
-  // In production the built client is served from the same origin as the API.
-  if (fs.existsSync(clientDist)) {
-    app.use(express.static(clientDist));
-    app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+  app.use('/api', publicRoutes(sessionId));
+  app.use('/api/admin', adminRoutes(sessionId));
+
+  app.use('/api', (_req, res) => res.status(404).json({ error: 'not_found' }));
+
+  if (serveClient && fs.existsSync(CLIENT_DIST)) {
+    app.use(express.static(CLIENT_DIST));
+    app.get('*', (_req, res) => res.sendFile(path.join(CLIENT_DIST, 'index.html')));
   }
 
-  // Constraint violations mean a real invariant was hit -- report them as 409
-  // rather than leaking a 500 and a stack trace.
-  app.use((err, req, res, next) => {
-    if (typeof err?.code === 'string' && err.code.startsWith('SQLITE_CONSTRAINT')) {
-      return res.status(409).json({ error: 'That change conflicts with an existing record.' });
+  // eslint-disable-next-line no-unused-vars -- express needs the 4-arg shape
+  app.use((err, _req, res, _next) => {
+    if (err instanceof AppError) {
+      return res.status(err.status).json({ error: err.code, message: err.message });
     }
     console.error(err);
-    res.status(500).json({ error: 'Something went wrong.' });
+    res.status(500).json({ error: 'server_error', message: 'Something went wrong.' });
   });
 
   return app;

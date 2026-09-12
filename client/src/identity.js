@@ -1,39 +1,26 @@
 /**
- * Browser-side persistence of the participant identity.
- *
- * Only the immutable UUID is authoritative here; the cached display name is a
- * convenience for first paint. On load the UUID is re-validated against the
- * server, so a stale or deleted identity falls back to the join screen.
+ * The browser remembers only the participant UUID. The display name and every
+ * vote live on the server, so returning to this browser restores the same
+ * participant -- and renaming never creates a second one.
  */
-const KEY = 'voting-platform.participant-id';
-const NAME_KEY = 'voting-platform.display-name';
-const ADMIN_KEY = 'voting-platform.admin-token';
+const KEY = 'strategy-voting:participant-id';
 
-const safe = (fn, fallback = null) => {
+export function getParticipantId() {
   try {
-    return fn();
+    return localStorage.getItem(KEY);
   } catch {
-    return fallback; // private mode / blocked storage
+    return null; // private mode, embedded webview
   }
-};
-
-export const storedParticipantId = () => safe(() => localStorage.getItem(KEY));
-export const storedDisplayName = () => safe(() => localStorage.getItem(NAME_KEY));
-
-export function rememberParticipant(participant) {
-  safe(() => {
-    localStorage.setItem(KEY, participant.id);
-    localStorage.setItem(NAME_KEY, participant.displayName);
-  });
 }
 
-export function forgetParticipant() {
-  safe(() => {
+export function rememberParticipantId(id) {
+  try {
+    localStorage.setItem(KEY, id);
+  } catch { /* the session still works, it just will not survive a reload */ }
+}
+
+export function forgetParticipantId() {
+  try {
     localStorage.removeItem(KEY);
-    localStorage.removeItem(NAME_KEY);
-  });
+  } catch { /* nothing to do */ }
 }
-
-export const storedAdminToken = () => safe(() => localStorage.getItem(ADMIN_KEY));
-export const rememberAdminToken = (token) => safe(() => localStorage.setItem(ADMIN_KEY, token));
-export const forgetAdminToken = () => safe(() => localStorage.removeItem(ADMIN_KEY));

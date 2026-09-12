@@ -1,61 +1,69 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
-import { isValidAdminSession } from './store.js';
+import { timingSafeEqual } from 'node:crypto';
+import { forbidden } from './errors.js';
 
-/**
- * Admin authorisation. Enforced here, on every /api/admin/* request -- the
- * client only ever hides buttons, which is decoration, not security.
- *
- * One shared passcode is exchanged for a server-stored bearer token. That is
- * the right weight for a workshop prototype: no user accounts to manage, but
- * the check still happens on the server and the token can be revoked.
- */
+export const DEFAULT_PASSCODE = 'let-me-in';
 
-export const DEV_PASSCODE = 'let-me-in';
-
-export function configuredPasscode() {
-  return process.env.ADMIN_PASSCODE || DEV_PASSCODE;
+export function adminPasscode() {
+  return process.env.ADMIN_PASSCODE || DEFAULT_PASSCODE;
 }
 
-export function passcodeMatches(supplied) {
-  const a = createHash('sha256').update(String(supplied ?? '')).digest();
-  const b = createHash('sha256').update(configuredPasscode()).digest();
-  return timingSafeEqual(a, b); // hashes are equal-length, so this is safe
+function constantTimeEquals(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
 }
 
-/* A deliberately small brute-force guard: the passcode is short and shared. */
-const ATTEMPT_WINDOW_MS = 5 * 60_000;
-const MAX_ATTEMPTS = 10;
+// Per-IP backoff on wrong passcodes. In-memory on purpose: a serverless cold
+// start resets it, which is an acceptable trade for a workshop tool.
 const attempts = new Map();
+const WINDOW_MS = 60_000;
+const MAX_ATTEMPTS = 8;
 
-export function throttleState(key, now = Date.now()) {
-  const rec = attempts.get(key);
-  if (!rec || now - rec.firstAt > ATTEMPT_WINDOW_MS) return { blocked: false, remaining: MAX_ATTEMPTS };
-  return { blocked: rec.count >= MAX_ATTEMPTS, remaining: Math.max(0, MAX_ATTEMPTS - rec.count) };
+export function checkThrottle(ip) {
+  const now = Date.now();
+  const entry = attempts.get(ip);
+  if (!entry || now > entry.resetAt) return;
+  if (entry.count >= MAX_ATTEMPTS) {
+    throw forbidden('too_many_attempts', 'Too many attempts. Wait a minute and try again.');
+  }
 }
 
-export function recordFailure(key, now = Date.now()) {
-  const rec = attempts.get(key);
-  if (!rec || now - rec.firstAt > ATTEMPT_WINDOW_MS) attempts.set(key, { count: 1, firstAt: now });
-  else rec.count += 1;
+export function recordFailure(ip) {
+  const now = Date.now();
+  const entry = attempts.get(ip);
+  if (!entry || now > entry.resetAt) attempts.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+  else entry.count += 1;
 }
 
-export function clearFailures(key) {
-  attempts.delete(key);
+export function recordSuccess(ip) {
+  attempts.delete(ip);
 }
 
 export function bearerToken(req) {
-  const header = req.get('authorization') ?? '';
-  return header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+  const header = req.get?.('authorization') ?? req.headers?.authorization ?? '';
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match ? match[1].trim() : null;
 }
 
-/** Express middleware: 401s anything without a live admin session. */
-export function requireAdmin(db) {
-  return (req, res, next) => {
-    const token = bearerToken(req);
-    if (!isValidAdminSession(db, token)) {
-      return res.status(401).json({ error: 'Admin authorisation required.' });
-    }
-    req.adminToken = token;
-    next();
-  };
+export function verifyPasscode(candidate) {
+  return constantTimeEquals(candidate ?? '', adminPasscode());
+}
+
+/**
+ * The only thing standing between a caller and every admin route. It re-checks
+ * a server-issued token against the database on every single request, so the
+ * client hiding a button has no bearing on authorisation.
+ */
+export function requireAdmin(req, res, next) {
+  const token = bearerToken(req);
+  if (!token) return res.status(401).json({ error: 'admin_required', message: 'Admin sign-in required.' });
+  req.store
+    .findAdminToken(token)
+    .then((row) => {
+      if (!row) return res.status(401).json({ error: 'admin_required', message: 'Session expired. Sign in again.' });
+      req.adminToken = token;
+      next();
+    })
+    .catch(next);
 }

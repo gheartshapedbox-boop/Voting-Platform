@@ -1,26 +1,19 @@
 import React, { useState } from 'react';
-import { api } from '../api.js';
 
-/**
- * Kahoot-style entry: a name and a button. No email, no password.
- * "Resume with code" is the discreet second path for someone returning on a
- * different browser or device.
- */
-export default function JoinScreen({ settings, onJoined }) {
-  const [mode, setMode] = useState('join');
+export default function JoinScreen({ onJoin, onResume, sessionName }) {
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
-  const [error, setError] = useState('');
+  const [showResume, setShowResume] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
 
   const submit = async (event) => {
     event.preventDefault();
-    setError('');
     setBusy(true);
+    setError(null);
     try {
-      const participant =
-        mode === 'join' ? await api.join(name) : await api.resume(code);
-      onJoined(participant, { isNew: mode === 'join' });
+      if (showResume) await onResume(code);
+      else await onJoin(name);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -29,68 +22,54 @@ export default function JoinScreen({ settings, onJoined }) {
   };
 
   return (
-    <div className="page" style={{ maxWidth: 460 }}>
-      <div className="card">
-        <h1>{settings?.event_title ?? 'Strategy Voting'}</h1>
+    <div className="stack" style={{ maxWidth: 420, margin: '6vh auto 0' }}>
+      <div className="center stack-s">
+        <h1>{sessionName ?? 'Strategy voting'}</h1>
+        <p className="secondary">No sign-up. Pick a name and you are in.</p>
+      </div>
 
-        {mode === 'join' ? (
-          <form onSubmit={submit}>
-            <p className="muted small">
-              No account needed. Pick any name &mdash; it is just a label for the room.
-            </p>
-            {error && <div className="error">{error}</div>}
-            <label htmlFor="display-name">Enter your name or moniker</label>
-            <input
-              id="display-name"
-              type="text"
-              value={name}
-              autoFocus
-              autoComplete="off"
-              maxLength={40}
-              placeholder="e.g. Quoc Duy"
-              onChange={(e) => setName(e.target.value)}
-            />
-            <div className="row" style={{ marginTop: 16 }}>
-              <button type="submit" disabled={busy || name.trim() === ''}>
-                {busy ? 'Joining…' : 'Join'}
-              </button>
-            </div>
-            <div style={{ marginTop: 18 }} className="tiny muted">
+      <form className="card stack" onSubmit={submit}>
+        {showResume ? (
+          <label className="field">
+            Your resume code
+            <input type="text" className="input-xl code-input" value={code} autoFocus
+                   maxLength={5} placeholder="K7M4Q" autoComplete="off"
+                   style={{ letterSpacing: '.2em', textTransform: 'uppercase' }}
+                   onChange={(e) => setCode(e.target.value)} />
+          </label>
+        ) : (
+          <label className="field">
+            Enter your name or moniker
+            <input type="text" className="input-xl" value={name} autoFocus
+                   maxLength={40} placeholder="e.g. Quoc Duy" autoComplete="off"
+                   onChange={(e) => setName(e.target.value)} />
+          </label>
+        )}
+
+        {error && <div className="notice error">{error}</div>}
+
+        <button type="submit" className="primary xl"
+                disabled={busy || (showResume ? !code.trim() : !name.trim())}>
+          {busy ? 'One moment…' : showResume ? 'Resume' : 'Join'}
+        </button>
+
+        <div className="center small">
+          {showResume ? (
+            <button type="button" className="ghost small"
+                    onClick={() => { setShowResume(false); setError(null); }}>
+              ← Back to joining
+            </button>
+          ) : (
+            <span className="muted">
               Already participated?{' '}
-              <button type="button" className="link" onClick={() => { setMode('resume'); setError(''); }}>
+              <button type="button" className="ghost small"
+                      onClick={() => { setShowResume(true); setError(null); }}>
                 Resume with code
               </button>
-            </div>
-          </form>
-        ) : (
-          <form onSubmit={submit}>
-            <p className="muted small">
-              Enter the 5-character code shown when you first joined.
-            </p>
-            {error && <div className="error">{error}</div>}
-            <label htmlFor="recovery-code">Recovery code</label>
-            <input
-              id="recovery-code"
-              type="text"
-              className="code"
-              value={code}
-              autoFocus
-              autoComplete="off"
-              maxLength={7}
-              placeholder="K7M4Q"
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-            />
-            <div className="row" style={{ marginTop: 16 }}>
-              <button type="submit" disabled={busy || code.trim().length < 5}>
-                {busy ? 'Checking…' : 'Resume'}
-              </button>
-              <button type="button" className="secondary" onClick={() => { setMode('join'); setError(''); }}>
-                Back
-              </button>
-            </div>
-          </form>
-        )}
-      </div>
+            </span>
+          )}
+        </div>
+      </form>
     </div>
   );
 }

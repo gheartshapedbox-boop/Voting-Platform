@@ -1,122 +1,132 @@
-/**
- * Result aggregation. Pure functions over plain objects -- no SQL, no React.
- * Everything the charts draw is computed here, so the maths can be tested and
- * changed without touching any rendering code.
- */
+import { badRequest } from '../errors.js';
 
-export const SCALE = { min: 1, max: 10 };
-export const MIDPOINT = (SCALE.min + SCALE.max) / 2; // 5.5
+// The rating scale. Change these three numbers and the whole app -- validation,
+// aggregates, quadrant split, and the chart axes -- follows.
+export const SCALE_MIN = 1;
+export const SCALE_MAX = 5;
+export const MIDPOINT = 3;
 
-/**
- * Quadrant keys are positional (x/y high/low) rather than named after a
- * particular pair of axis labels, because the axis labels are configurable.
- * The nicknames are a convenience the UI may show alongside the real labels.
- */
+export const RATED = 'RATED';
+export const NOT_SURE = 'NOT_SURE';
+
 export const QUADRANTS = {
-  'high-high': { nickname: 'Do now', x: 'high', y: 'high' },
-  'low-high': { nickname: 'Big bets', x: 'low', y: 'high' },
-  'high-low': { nickname: 'Easy fills', x: 'high', y: 'low' },
-  'low-low': { nickname: 'Deprioritise', x: 'low', y: 'low' },
+  QUICK_WIN: { key: 'QUICK_WIN', label: 'Quick wins',   hint: 'High benefit, low effort' },
+  BIG_BET:   { key: 'BIG_BET',   label: 'Big bets',     hint: 'High benefit, high effort' },
+  FILL_IN:   { key: 'FILL_IN',   label: 'Fill-ins',     hint: 'Low benefit, low effort' },
+  AVOID:     { key: 'AVOID',     label: 'Thankless',    hint: 'Low benefit, high effort' },
 };
 
-export function quadrantKey(x, y) {
-  return `${x >= MIDPOINT ? 'high' : 'low'}-${y >= MIDPOINT ? 'high' : 'low'}`;
-}
+const round1 = (n) => Math.round(n * 10) / 10;
+const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 
-export function mean(values) {
-  if (values.length === 0) return null;
-  return values.reduce((a, b) => a + b, 0) / values.length;
-}
-
-export function median(values) {
-  if (values.length === 0) return null;
-  const s = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+export function isValidScore(value) {
+  return Number.isInteger(value) && value >= SCALE_MIN && value <= SCALE_MAX;
 }
 
 /**
- * Votes land on integer coordinates, so many participants share a point.
- * Collapsing duplicates into one dot with a count is honest -- unlike jitter,
- * which invents positions nobody voted for.
+ * Turns whatever the client sent into a response row, or throws.
+ * NOT_SURE always clears benefit/effort -- the same rule the DB CHECK enforces.
  */
-export function clusterPoints(votes) {
-  const byCell = new Map();
-  for (const v of votes) {
-    const key = `${v.x}:${v.y}`;
-    const hit = byCell.get(key);
-    if (hit) hit.count += 1;
-    else byCell.set(key, { x: v.x, y: v.y, count: 1 });
+export function normalizeResponseInput(input) {
+  const kind = input?.kind;
+
+  if (kind === NOT_SURE) {
+    return { kind: NOT_SURE, benefit: null, effort: null };
   }
-  return [...byCell.values()].sort((a, b) => a.x - b.x || a.y - b.y);
+  if (kind !== RATED) {
+    throw badRequest('bad_kind', `kind must be "${RATED}" or "${NOT_SURE}".`);
+  }
+  const benefit = input.benefit;
+  const effort = input.effort;
+  if (!isValidScore(benefit)) {
+    throw badRequest('bad_benefit', `Benefit must be a whole number ${SCALE_MIN}-${SCALE_MAX}.`);
+  }
+  if (!isValidScore(effort)) {
+    throw badRequest('bad_effort', `Effort must be a whole number ${SCALE_MIN}-${SCALE_MAX}.`);
+  }
+  return { kind: RATED, benefit, effort };
 }
 
 /**
- * Mean distance of each vote from the group centroid: a plain-language
- * "how much did the room disagree" number on the same 1-10 scale as the axes.
+ * The core aggregate rule.
+ *
+ *   responded = everyone who answered at all (RATED + NOT_SURE)
+ *   rated     = only those who gave scores
+ *   averages  = computed from RATED responses ONLY, null when there are none
  */
-export function dispersion(votes, centre) {
-  if (votes.length < 2) return 0;
-  const total = votes.reduce(
-    (sum, v) => sum + Math.hypot(v.x - centre.x, v.y - centre.y),
-    0,
-  );
-  return total / votes.length;
-}
-
-/** Above this mean distance the room is meaningfully split on a strategy. */
-export const CONTESTED_THRESHOLD = 2.5;
-
-export function summariseStrategy(strategy, votes) {
-  const xs = votes.map((v) => v.x);
-  const ys = votes.map((v) => v.y);
-  const centre = votes.length
-    ? { x: mean(xs), y: mean(ys) }
-    : { x: null, y: null };
-  const spread = votes.length ? dispersion(votes, centre) : 0;
+export function aggregate(responses) {
+  const rated = responses.filter((r) => r.kind === RATED);
+  const notSure = responses.filter((r) => r.kind === NOT_SURE);
 
   return {
-    id: strategy.id,
-    title: strategy.title,
-    description: strategy.description ?? '',
-    voteCount: votes.length,
-    mean: centre,
-    median: { x: median(xs), y: median(ys) },
-    dispersion: spread,
-    contested: votes.length >= 3 && spread > CONTESTED_THRESHOLD,
-    quadrant: votes.length ? quadrantKey(centre.x, centre.y) : null,
-    // Anonymous by construction: no participant id ever reaches a point.
-    points: clusterPoints(votes),
+    responded: responses.length,
+    rated: rated.length,
+    notSure: notSure.length,
+    avgBenefit: rated.length ? round1(mean(rated.map((r) => r.benefit))) : null,
+    avgEffort: rated.length ? round1(mean(rated.map((r) => r.effort))) : null,
   };
 }
 
 /**
- * @param strategies [{id,title,description}]
- * @param votes      [{strategy_id, participant_id, x_score, y_score}]
+ * Ties go to the optimistic side: exactly MIDPOINT counts as high benefit and
+ * as high effort. Move the comparison here if management disagrees.
  */
-export function buildResults(strategies, votes) {
+export function quadrantOf(avgBenefit, avgEffort) {
+  if (avgBenefit == null || avgEffort == null) return null;
+  const highBenefit = avgBenefit >= MIDPOINT;
+  const highEffort = avgEffort >= MIDPOINT;
+  if (highBenefit) return highEffort ? QUADRANTS.BIG_BET.key : QUADRANTS.QUICK_WIN.key;
+  return highEffort ? QUADRANTS.AVOID.key : QUADRANTS.FILL_IN.key;
+}
+
+/** One row per strategy: its counts, its averages, its quadrant. */
+export function buildStrategyResults(strategies, responses) {
   const byStrategy = new Map(strategies.map((s) => [s.id, []]));
-  for (const v of votes) {
-    byStrategy.get(v.strategy_id)?.push({ x: v.x_score, y: v.y_score });
+  for (const r of responses) {
+    if (byStrategy.has(r.strategy_id)) byStrategy.get(r.strategy_id).push(r);
   }
-  return strategies.map((s) => summariseStrategy(s, byStrategy.get(s.id) ?? []));
+  return strategies.map((s) => {
+    const stats = aggregate(byStrategy.get(s.id));
+    return {
+      id: s.id,
+      title: s.title,
+      description: s.description,
+      archived: s.archived_at != null,
+      ...stats,
+      quadrant: quadrantOf(stats.avgBenefit, stats.avgEffort),
+    };
+  });
 }
 
-export function summariseParticipation(participants, votes, strategyCount) {
-  const votesBy = new Map();
-  for (const v of votes) {
-    votesBy.set(v.participant_id, (votesBy.get(v.participant_id) ?? 0) + 1);
-  }
-  const responded = [...votesBy.values()].filter((n) => n > 0).length;
-  const complete = strategyCount === 0
-    ? 0
-    : [...votesBy.values()].filter((n) => n >= strategyCount).length;
+/**
+ * What the Final Dashboard plots. A strategy with zero RATED responses has null
+ * averages and therefore no position -- it is listed separately, never guessed
+ * onto the chart at some default coordinate.
+ */
+export function dashboardPoints(strategyResults, { includeArchived = false } = {}) {
+  return strategyResults.filter(
+    (s) => (includeArchived || !s.archived) && s.rated > 0 && s.avgBenefit != null && s.avgEffort != null,
+  );
+}
 
-  return {
-    participantCount: participants.length,
-    respondedCount: responded,
-    completedCount: complete,
-    strategyCount,
-    totalVotes: votes.length,
-  };
+export function unplottedStrategies(strategyResults, { includeArchived = false } = {}) {
+  return strategyResults.filter((s) => (includeArchived || !s.archived) && s.rated === 0);
+}
+
+/** Admin participant list: how far through the active strategies each one is. */
+export function participantProgress(participants, responses, activeStrategyIds) {
+  const active = new Set(activeStrategyIds);
+  const counts = new Map();
+  for (const r of responses) {
+    if (!active.has(r.strategy_id)) continue;
+    counts.set(r.participant_id, (counts.get(r.participant_id) ?? 0) + 1);
+  }
+  return participants.map((p) => ({
+    id: p.id,
+    displayName: p.display_name,
+    recoveryCode: p.recovery_code,
+    joinedAt: p.joined_at,
+    responded: counts.get(p.id) ?? 0,
+    total: active.size,
+  }));
 }

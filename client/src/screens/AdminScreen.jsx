@@ -1,363 +1,289 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { api } from '../api.js';
-import { forgetAdminToken, rememberAdminToken, storedAdminToken } from '../identity.js';
+import React, { useEffect, useState } from 'react';
+import { api, setAdminToken, hasAdminToken } from '../api.js';
+import ResultsPanel from '../components/ResultsPanel.jsx';
 
-const when = (iso) => {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-};
-
-function AdminLogin({ onToken }) {
+function LoginCard({ onSignedIn }) {
   const [passcode, setPasscode] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
 
-  const submit = async (event) => {
-    event.preventDefault();
-    setBusy(true);
-    setError('');
-    try {
-      const { token } = await api.admin.login(passcode);
-      rememberAdminToken(token);
-      onToken(token);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
-    <div className="page" style={{ maxWidth: 420 }}>
-      <div className="card">
-        <h1>Facilitator access</h1>
-        <p className="muted small">
-          The passcode is checked on the server. Every admin action is re-checked
-          against the issued token, so there is nothing here a hidden button would unlock.
-        </p>
-        {error && <div className="error">{error}</div>}
-        <form onSubmit={submit}>
-          <label htmlFor="passcode">Admin passcode</label>
-          <input id="passcode" type="password" value={passcode} autoFocus
-                 onChange={(e) => setPasscode(e.target.value)} />
-          <div style={{ marginTop: 16 }}>
-            <button type="submit" disabled={busy || !passcode}>{busy ? 'Checking…' : 'Sign in'}</button>
-          </div>
-        </form>
-      </div>
-    </div>
+    <form className="card stack" style={{ maxWidth: 380, margin: '6vh auto 0' }}
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setBusy(true); setError(null);
+            try {
+              const { token } = await api.adminLogin(passcode);
+              setAdminToken(token);
+              onSignedIn();
+            } catch (err) {
+              setError(err.message);
+            } finally {
+              setBusy(false);
+            }
+          }}>
+      <h1>Facilitator</h1>
+      <label className="field">
+        Admin passcode
+        <input type="password" value={passcode} autoFocus autoComplete="current-password"
+               onChange={(e) => setPasscode(e.target.value)} />
+      </label>
+      {error && <div className="notice error">{error}</div>}
+      <button type="submit" className="primary xl" disabled={busy || !passcode}>
+        {busy ? 'Checking…' : 'Sign in'}
+      </button>
+      <p className="muted small">
+        Every admin action is checked against this sign-in on the server, not in the browser.
+      </p>
+    </form>
   );
 }
 
-function StrategyManager({ token, strategies, reload }) {
-  const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
-  const [editing, setEditing] = useState(null);
-  const [error, setError] = useState('');
+function StrategyRow({ strategy, onChanged }) {
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(strategy.title);
+  const [description, setDescription] = useState(strategy.description ?? '');
 
-  const guard = async (fn) => {
-    try { await fn(); setError(''); await reload(); }
-    catch (err) { setError(err.message); }
-  };
-
-  return (
-    <div className="card">
-      <h2>Strategies</h2>
-      {error && <div className="error">{error}</div>}
-
-      <form
-        className="stack"
-        onSubmit={(e) => {
-          e.preventDefault();
-          guard(async () => {
-            await api.admin.createStrategy(token, { title, description });
-            setTitle('');
-            setDescription('');
-          });
-        }}
-      >
-        <div>
-          <label htmlFor="s-title">New strategy</label>
-          <input id="s-title" type="text" value={title} maxLength={120}
-                 placeholder="e.g. Launch a self-serve tier"
-                 onChange={(e) => setTitle(e.target.value)} />
-        </div>
-        <div>
-          <label htmlFor="s-desc">Description (optional)</label>
-          <textarea id="s-desc" value={description} onChange={(e) => setDescription(e.target.value)} />
-        </div>
-        <div><button type="submit" disabled={!title.trim()}>Add strategy</button></div>
-      </form>
-
-      <div className="table-wrap" style={{ marginTop: 20 }}>
-        <table>
-          <thead>
-            <tr><th>Title</th><th>Status</th><th style={{ width: 250 }}>Actions</th></tr>
-          </thead>
-          <tbody>
-            {strategies.length === 0 && (
-              <tr><td colSpan={3} className="muted">No strategies yet.</td></tr>
-            )}
-            {strategies.map((s) => (
-              <tr key={s.id}>
-                <td>
-                  {editing?.id === s.id ? (
-                    <form
-                      className="stack"
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        guard(async () => {
-                          await api.admin.updateStrategy(token, s.id, {
-                            title: editing.title, description: editing.description,
-                          });
-                          setEditing(null);
-                        });
-                      }}
-                    >
-                      <input type="text" value={editing.title}
-                             onChange={(e) => setEditing({ ...editing, title: e.target.value })} />
-                      <textarea value={editing.description}
-                                onChange={(e) => setEditing({ ...editing, description: e.target.value })} />
-                      <div className="row">
-                        <button type="submit" className="small">Save</button>
-                        <button type="button" className="secondary small" onClick={() => setEditing(null)}>Cancel</button>
-                      </div>
-                    </form>
-                  ) : (
-                    <>
-                      <strong>{s.title}</strong>
-                      {s.description && <div className="tiny muted">{s.description}</div>}
-                    </>
-                  )}
-                </td>
-                <td>
-                  <span className="badge">{s.archived ? 'Hidden' : 'Live'}</span>
-                </td>
-                <td>
-                  {editing?.id !== s.id && (
-                    <div className="row" style={{ gap: 6 }}>
-                      <button className="secondary small"
-                              onClick={() => setEditing({ id: s.id, title: s.title, description: s.description })}>
-                        Edit
-                      </button>
-                      <button className="secondary small"
-                              onClick={() => guard(() => api.admin.updateStrategy(token, s.id, { archived: !s.archived }))}>
-                        {s.archived ? 'Show' : 'Hide'}
-                      </button>
-                      <button
-                        className="danger small"
-                        onClick={() => {
-                          if (confirm(`Delete "${s.title}" and all votes on it?`)) {
-                            guard(() => api.admin.deleteStrategy(token, s.id));
-                          }
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function SettingsPanel({ token, settings, reload }) {
-  const [draft, setDraft] = useState(settings);
-  const [saved, setSaved] = useState(false);
-  useEffect(() => setDraft(settings), [settings]);
-
-  const field = (key, label) => (
-    <div key={key}>
-      <label htmlFor={key}>{label}</label>
-      <input id={key} type="text" value={draft[key] ?? ''}
-             onChange={(e) => { setDraft({ ...draft, [key]: e.target.value }); setSaved(false); }} />
-    </div>
-  );
+  if (editing) {
+    return (
+      <tr>
+        <td colSpan={5}>
+          <form className="stack-s" onSubmit={async (e) => {
+            e.preventDefault();
+            await api.editStrategy(strategy.id, { title, description });
+            setEditing(false);
+            onChanged();
+          }}>
+            <input type="text" value={title} maxLength={120} autoFocus
+                   onChange={(e) => setTitle(e.target.value)} />
+            <textarea value={description} placeholder="Optional description"
+                      onChange={(e) => setDescription(e.target.value)} />
+            <div className="row">
+              <button type="submit" className="primary sm" disabled={!title.trim()}>Save</button>
+              <button type="button" className="ghost sm" onClick={() => setEditing(false)}>Cancel</button>
+            </div>
+          </form>
+        </td>
+      </tr>
+    );
+  }
 
   return (
-    <div className="card">
-      <h2>Wording</h2>
-      <p className="tiny muted">Axis labels feed the voting screen and the chart.</p>
-      <form
-        className="stack"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          await api.admin.updateSettings(token, draft);
-          await reload();
-          setSaved(true);
-        }}
-      >
-        {field('event_title', 'Event title')}
-        {field('y_label', 'Vertical axis label')}
-        {field('y_hint', 'Vertical axis hint')}
-        {field('x_label', 'Horizontal axis label')}
-        {field('x_hint', 'Horizontal axis hint')}
+    <tr style={strategy.archived ? { opacity: 0.6 } : undefined}>
+      <td>
         <div className="row">
-          <button type="submit">Save wording</button>
-          {saved && <span className="badge badge--good">✓ Saved</span>}
+          <span>{strategy.title}</span>
+          {strategy.archived && <span className="badge archived">Archived</span>}
         </div>
-      </form>
-    </div>
+        {strategy.description && <div className="muted small">{strategy.description}</div>}
+      </td>
+      <td className="num">{strategy.responded}</td>
+      <td className="num">{strategy.rated}</td>
+      <td className="num">{strategy.notSure}</td>
+      <td>
+        <div className="row" style={{ justifyContent: 'flex-end' }}>
+          <button className="ghost sm" onClick={() => setEditing(true)}>Edit</button>
+          {strategy.archived ? (
+            <button className="sm" onClick={async () => { await api.restoreStrategy(strategy.id); onChanged(); }}>
+              Restore
+            </button>
+          ) : (
+            <button className="sm danger" onClick={async () => { await api.archiveStrategy(strategy.id); onChanged(); }}>
+              Archive
+            </button>
+          )}
+        </div>
+      </td>
+    </tr>
   );
 }
 
 export default function AdminScreen() {
-  const [token, setToken] = useState(storedAdminToken());
-  const [checked, setChecked] = useState(false);
-  const [roster, setRoster] = useState(null);
-  const [strategies, setStrategies] = useState([]);
-  const [settings, setSettings] = useState({});
-  const [error, setError] = useState('');
+  const [signedIn, setSignedIn] = useState(hasAdminToken());
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [newTitle, setNewTitle] = useState('');
+  const [newDescription, setNewDescription] = useState('');
+  const [showArchived, setShowArchived] = useState(false);
 
-  const signOut = useCallback(async () => {
-    if (token) await api.admin.logout(token).catch(() => {});
-    forgetAdminToken();
-    setToken(null);
-  }, [token]);
-
-  const reload = useCallback(async () => {
-    if (!token) return;
+  const refresh = async () => {
     try {
-      const [people, list, session] = await Promise.all([
-        api.admin.participants(token),
-        api.admin.strategies(token),
-        api.session(),
-      ]);
-      setRoster(people);
-      setStrategies(list);
-      setSettings(session.settings);
-      setError('');
+      setData(await api.overview());
+      setError(null);
     } catch (err) {
-      if (err.status === 401) { forgetAdminToken(); setToken(null); }
+      if (err.status === 401) { setAdminToken(null); setSignedIn(false); }
       else setError(err.message);
     }
-  }, [token]);
-
-  // Verify the stored token with the server before trusting it.
-  useEffect(() => {
-    if (!token) { setChecked(true); return; }
-    api.admin.check(token)
-      .then(() => reload())
-      .catch(() => { forgetAdminToken(); setToken(null); })
-      .finally(() => setChecked(true));
-  }, [token, reload]);
+  };
 
   useEffect(() => {
-    if (!token) return undefined;
-    const timer = setInterval(reload, 6000);
+    if (!signedIn) return undefined;
+    refresh();
+    const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
-  }, [token, reload]);
+  }, [signedIn]);
 
-  if (!checked) return <div className="page"><p className="muted">Loading…</p></div>;
-  if (!token) return <AdminLogin onToken={setToken} />;
+  if (!signedIn) return <LoginCard onSignedIn={() => setSignedIn(true)} />;
+  if (!data) return <div className="spinner">Loading…</div>;
 
-  const participation = roster?.participation;
+  const locked = data.session.status === 'LOCKED';
+  const visibleStrategies = data.strategies.filter((s) => showArchived || !s.archived);
+  const archivedCount = data.strategies.filter((s) => s.archived).length;
+  const joinUrl = `${location.origin}/`;
 
   return (
-    <div className="page page--wide">
-      <div className="row row--between" style={{ marginBottom: 16 }}>
-        <h1>Facilitator dashboard</h1>
-        <button className="secondary small" onClick={signOut}>Sign out</button>
-      </div>
-      {error && <div className="error">{error}</div>}
+    <div className="stack">
+      {error && <div className="notice error">{error}</div>}
 
-      {participation && (
-        <div className="tiles" style={{ marginBottom: 16 }}>
-          <div className="tile">
-            <div className="value">{participation.participantCount}</div>
-            <div className="label">Joined</div>
+      <div className="row-between">
+        <h1>Facilitator</h1>
+        <div className="row">
+          <span className={`badge ${locked ? 'locked' : 'open'}`}>
+            {locked ? 'Voting locked' : 'Voting open'}
+          </span>
+          <button className="ghost sm" onClick={async () => {
+            try { await api.adminLogout(); } finally { setAdminToken(null); setSignedIn(false); }
+          }}>Sign out</button>
+        </div>
+      </div>
+
+      {/* ---- session control ---- */}
+      <div className="card stack-s">
+        <div className="row-between">
+          <div>
+            <h2>Session</h2>
+            <p className="secondary small">
+              {locked
+                ? 'Participants can see their answers but cannot change them.'
+                : 'Participants can add and change answers.'}
+            </p>
           </div>
-          <div className="tile">
-            <div className="value">{participation.respondedCount}</div>
-            <div className="label">Responded</div>
-          </div>
-          <div className="tile">
-            <div className="value">{participation.completedCount}</div>
-            <div className="label">Finished all {participation.strategyCount}</div>
-          </div>
-          <div className="tile">
-            <div className="value">{participation.totalVotes}</div>
-            <div className="label">Votes cast</div>
+          <div className="row">
+            <button className={locked ? 'primary' : ''}
+                    onClick={async () => { await api.setStatus(locked ? 'OPEN' : 'LOCKED'); refresh(); }}>
+              {locked ? 'Reopen voting' : 'Lock voting'}
+            </button>
+            <button className="danger sm" onClick={async () => {
+              if (confirm('Delete every response in this session? This cannot be undone.')) {
+                await api.clearResponses();
+                refresh();
+              }
+            }}>Clear all responses</button>
           </div>
         </div>
-      )}
+        <div className="panel small secondary">
+          Participants join at <strong>{joinUrl}</strong> — no account needed.
+        </div>
+      </div>
 
-      <div className="card">
-        <h2>Participants</h2>
-        <div className="table-wrap">
+      {/* ---- strategies ---- */}
+      <div className="card stack">
+        <div className="row-between">
+          <h2>Strategies</h2>
+          {archivedCount > 0 && (
+            <button className="ghost sm" onClick={() => setShowArchived((v) => !v)}>
+              {showArchived ? 'Hide' : 'Show'} archived ({archivedCount})
+            </button>
+          )}
+        </div>
+
+        <form className="stack-s" onSubmit={async (e) => {
+          e.preventDefault();
+          await api.addStrategy(newTitle, newDescription);
+          setNewTitle(''); setNewDescription('');
+          refresh();
+        }}>
+          <div className="row">
+            <input className="grow" type="text" value={newTitle} maxLength={120}
+                   placeholder="Add a strategy…" onChange={(e) => setNewTitle(e.target.value)} />
+            <button type="submit" className="primary" disabled={!newTitle.trim()}>Add</button>
+          </div>
+          {newTitle.trim() && (
+            <textarea value={newDescription} placeholder="Optional description"
+                      onChange={(e) => setNewDescription(e.target.value)} />
+          )}
+        </form>
+
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th className="num">Responded</th>
+                <th className="num">Rated</th>
+                <th className="num">Not sure</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {visibleStrategies.length === 0 && (
+                <tr><td colSpan={5} className="center muted" style={{ padding: 24 }}>
+                  Nothing yet — add the first strategy above.
+                </td></tr>
+              )}
+              {visibleStrategies.map((s) => (
+                <StrategyRow key={s.id} strategy={s} onChanged={refresh} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="muted small">
+          Archiving takes a strategy off the ballot and the dashboard. Its responses are kept,
+          and restoring brings them back.
+        </p>
+      </div>
+
+      {/* ---- participants ---- */}
+      <div className="card stack">
+        <div className="row-between">
+          <h2>Participants</h2>
+          <span className="badge">{data.participants.length} joined</span>
+        </div>
+        <div className="table-scroll">
           <table>
             <thead>
               <tr>
                 <th>Display name</th>
                 <th>Joined</th>
-                <th className="num">Responded</th>
+                <th>Progress</th>
                 <th>Resume code</th>
-                <th />
               </tr>
             </thead>
             <tbody>
-              {(roster?.participants ?? []).length === 0 && (
-                <tr><td colSpan={5} className="muted">Nobody has joined yet.</td></tr>
+              {data.participants.length === 0 && (
+                <tr><td colSpan={4} className="center muted" style={{ padding: 24 }}>
+                  No one has joined yet.
+                </td></tr>
               )}
-              {(roster?.participants ?? []).map((p) => (
+              {data.participants.map((p) => (
                 <tr key={p.id}>
+                  <td>{p.displayName}</td>
+                  <td className="muted small">{new Date(p.joinedAt).toLocaleTimeString()}</td>
                   <td>
-                    {p.displayName}
-                    {/* Display names are not unique; the id is the identity. */}
-                    <div className="tiny muted" title={p.id}>id {p.id.slice(0, 8)}…</div>
+                    <div className="row">
+                      <span className="small secondary" style={{ minWidth: 42 }}>
+                        {p.responded}/{p.total}
+                      </span>
+                      <div className="progress-track" style={{ width: 90 }}>
+                        <div className="progress-fill"
+                             style={{ width: p.total ? `${(p.responded / p.total) * 100}%` : '0%' }} />
+                      </div>
+                    </div>
                   </td>
-                  <td>{when(p.joinedAt)}</td>
-                  <td className="num">
-                    {p.votesCast} / {p.strategyCount}{' '}
-                    {p.complete && p.strategyCount > 0 && <span className="badge badge--good">done</span>}
-                  </td>
-                  <td><span className="code">{p.recoveryCode}</span></td>
-                  <td>
-                    <button
-                      className="danger small"
-                      onClick={async () => {
-                        if (confirm(`Remove ${p.displayName} and their votes?`)) {
-                          await api.admin.removeParticipant(token, p.id);
-                          reload();
-                        }
-                      }}
-                    >
-                      Remove
-                    </button>
-                  </td>
+                  <td><span className="code-chip">{p.recoveryCode}</span></td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-      </div>
-
-      <StrategyManager token={token} strategies={strategies} reload={reload} />
-      <SettingsPanel token={token} settings={settings} reload={reload} />
-
-      <div className="card">
-        <h2>Reset</h2>
         <p className="muted small">
-          Clears every vote but keeps participants and strategies &mdash; handy between
-          practice runs.
+          Names are labels, not identities — two people may share one. Responses on the dashboard
+          are never attributed.
         </p>
-        <button
-          className="danger"
-          onClick={async () => {
-            if (confirm('Delete all votes? Participants and strategies are kept.')) {
-              await api.admin.resetVotes(token);
-              reload();
-            }
-          }}
-        >
-          Clear all votes
-        </button>
       </div>
+
+      <ResultsPanel plotted={data.plotted} unplotted={data.unplotted}
+                    strategies={data.strategies} participantCount={data.participants.length} />
     </div>
   );
 }

@@ -1,9 +1,12 @@
 {
   "name": "voting-platform",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Strategy voting MVP - Kahoot-style join, anonymous scoring, admin dashboard.",
+  "description": "Strategy voting MVP - Kahoot-style join, benefit/effort scoring, facilitator dashboard.",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "concurrently -n api,web -c blue,magenta \"npm:dev:api\" \"npm:dev:web\"",
     "dev:api": "node --watch server/index.js",
@@ -13,14 +16,15 @@
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.10.0",
-    "express": "^4.21.2"
+    "@electric-sql/pglite": "^0.3.11",
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.2",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
     "vite": "^6.0.11"
   }
 }

@@ -1,134 +1,108 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { api } from './api.js';
-import {
-  forgetParticipant,
-  rememberParticipant,
-  storedParticipantId,
-} from './identity.js';
-import AdminScreen from './screens/AdminScreen.jsx';
+import { api, ApiError } from './api.js';
+import { getParticipantId, rememberParticipantId, forgetParticipantId } from './identity.js';
 import JoinScreen from './screens/JoinScreen.jsx';
-import ResultsScreen from './screens/ResultsScreen.jsx';
 import VoteScreen from './screens/VoteScreen.jsx';
+import AdminScreen from './screens/AdminScreen.jsx';
+import DashboardScreen from './screens/DashboardScreen.jsx';
 
-/** Minimal history-based router -- three screens do not need a routing library. */
-function useRoute() {
-  const [path, setPath] = useState(window.location.pathname);
+const routeFromHash = () => {
+  const hash = location.hash.replace(/^#\/?/, '');
+  return hash === 'admin' || hash === 'dashboard' ? hash : 'vote';
+};
+
+function ParticipantFlow() {
+  const [ballot, setBallot] = useState(null);
+  const [ready, setReady] = useState(false);
+
+  // On load, ask the server whether the id in this browser is still real. A
+  // stale id (cleared database, different deployment) drops cleanly to Join
+  // instead of leaving the page wedged.
+  const load = useCallback(async () => {
+    if (!getParticipantId()) { setBallot(null); setReady(true); return; }
+    try {
+      setBallot(await api.ballot());
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) forgetParticipantId();
+      setBallot(null);
+    } finally {
+      setReady(true);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Keep the ballot fresh so strategies the facilitator adds, and a lock,
+  // show up without anyone reloading.
   useEffect(() => {
-    const onPop = () => setPath(window.location.pathname);
-    window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
-  }, []);
-  const go = useCallback((next) => {
-    window.history.pushState({}, '', next);
-    setPath(next);
-  }, []);
-  return [path, go];
+    if (!ballot) return undefined;
+    const timer = setInterval(async () => {
+      try { setBallot(await api.ballot()); } catch { /* transient; the next tick retries */ }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [Boolean(ballot)]);
+
+  if (!ready) return <div className="spinner">Loading…</div>;
+
+  if (!ballot) {
+    const enter = async (participant) => {
+      rememberParticipantId(participant.id);
+      setBallot(await api.ballot());
+    };
+    return (
+      <JoinScreen
+        onJoin={async (name) => enter(await api.join(name))}
+        onResume={async (code) => enter(await api.resume(code))}
+      />
+    );
+  }
+
+  return (
+    <VoteScreen
+      ballot={ballot}
+      onResponse={(saved) => setBallot((current) => ({
+        ...current,
+        responses: [...current.responses.filter((r) => r.strategyId !== saved.strategyId), saved],
+      }))}
+      onRename={async (name) => {
+        const participant = await api.rename(name);
+        setBallot((current) => ({ ...current, participant }));
+      }}
+      onLeave={() => { forgetParticipantId(); setBallot(null); }}
+    />
+  );
 }
 
 export default function App() {
-  const [path, go] = useRoute();
-  const [session, setSession] = useState(null);
-  const [participant, setParticipant] = useState(null);
-  const [justJoined, setJustJoined] = useState(false);
-  const [ready, setReady] = useState(false);
+  const [route, setRoute] = useState(routeFromHash);
 
   useEffect(() => {
-    (async () => {
-      try {
-        setSession(await api.session());
-      } catch {
-        setSession({ settings: {}, scale: { min: 1, max: 10 } });
-      }
-
-      // Restore the identity this browser already holds. The UUID is the only
-      // thing stored; the server decides whether it is still valid.
-      const id = storedParticipantId();
-      if (id) {
-        try {
-          setParticipant(await api.restore(id));
-        } catch {
-          forgetParticipant(); // deleted or from a reset database
-        }
-      }
-      setReady(true);
-    })();
+    const onHashChange = () => setRoute(routeFromHash());
+    addEventListener('hashchange', onHashChange);
+    return () => removeEventListener('hashchange', onHashChange);
   }, []);
 
-  const handleJoined = (next, { isNew } = {}) => {
-    rememberParticipant(next);
-    setParticipant(next);
-    setJustJoined(!!isNew);
-  };
-
-  const handleRename = async (displayName) => {
-    // Same participant id, new label -- votes are untouched.
-    const updated = await api.rename(participant.id, displayName);
-    rememberParticipant(updated);
-    setParticipant(updated);
-  };
-
-  const leave = () => {
-    forgetParticipant();
-    setParticipant(null);
-    setJustJoined(false);
-    go('/');
-  };
-
-  if (!ready) return <div className="page"><p className="muted">Loading…</p></div>;
-
-  const isAdmin = path.startsWith('/admin');
-  const isResults = path.startsWith('/results');
+  const link = (key, label) => (
+    <a className="navlink" href={`#/${key === 'vote' ? '' : key}`}
+       aria-current={route === key ? 'page' : undefined}>
+      {label}
+    </a>
+  );
 
   return (
-    <>
+    <div className="app">
       <header className="topbar">
-        <div className="topbar-inner">
-          <nav className="nav">
-            <button onClick={() => go('/')} aria-current={!isAdmin && !isResults ? 'page' : undefined}>
-              Vote
-            </button>
-            <button onClick={() => go('/results')} aria-current={isResults ? 'page' : undefined}>
-              Results
-            </button>
-            <button onClick={() => go('/admin')} aria-current={isAdmin ? 'page' : undefined}>
-              Facilitator
-            </button>
-          </nav>
-          {participant && !isAdmin && (
-            <div className="row" style={{ gap: 8 }}>
-              <span className="chip">{participant.displayName}</span>
-              <button className="link tiny" onClick={leave}>Not you?</button>
-            </div>
-          )}
-        </div>
+        <span className="brand"><span className="brand-dot" />Strategy voting</span>
+        <nav className="navlinks">
+          {link('vote', 'Vote')}
+          {link('dashboard', 'Dashboard')}
+          {link('admin', 'Facilitator')}
+        </nav>
       </header>
 
-      {isAdmin ? (
-        <AdminScreen />
-      ) : isResults ? (
-        <ResultsScreen />
-      ) : participant ? (
-        <>
-          {justJoined && (
-            <div className="page" style={{ paddingBottom: 0 }}>
-              <div className="notice">
-                <strong>You&rsquo;re in, {participant.displayName}.</strong> This browser will
-                remember you. To carry on from another device, use your resume code{' '}
-                <span className="code">{participant.recoveryCode}</span>.{' '}
-                <button className="link" onClick={() => setJustJoined(false)}>Got it</button>
-              </div>
-            </div>
-          )}
-          <VoteScreen
-            participant={participant}
-            settings={session.settings}
-            scale={session.scale}
-            onRename={handleRename}
-          />
-        </>
-      ) : (
-        <JoinScreen settings={session.settings} onJoined={handleJoined} />
-      )}
-    </>
+      {route === 'admin' && <AdminScreen />}
+      {route === 'dashboard' && <DashboardScreen />}
+      {route === 'vote' && <ParticipantFlow />}
+    </div>
   );
 }

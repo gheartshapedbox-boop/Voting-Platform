@@ -1,147 +1,150 @@
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
 import {
-  CODE_LENGTH,
-  generateRecoveryCode,
-  isPlausibleRecoveryCode,
-  normaliseDisplayName,
-  normaliseRecoveryCode,
-  validateDisplayName,
-} from '../server/domain/identity.js';
-import {
-  buildResults,
-  clusterPoints,
-  dispersion,
-  median,
-  quadrantKey,
-  summariseParticipation,
+  aggregate,
+  buildStrategyResults,
+  dashboardPoints,
+  isValidScore,
+  normalizeResponseInput,
+  participantProgress,
+  quadrantOf,
+  unplottedStrategies,
 } from '../server/domain/results.js';
+import { normalizeDisplayName, newRecoveryCode, RECOVERY_CODE_LENGTH } from '../server/domain/identity.js';
 
-describe('display names', () => {
-  it('collapses whitespace but keeps the name as typed otherwise', () => {
-    assert.equal(normaliseDisplayName('  Quoc   Duy '), 'Quoc Duy');
-  });
+const rated = (benefit, effort) => ({ kind: 'RATED', benefit, effort });
+const notSure = () => ({ kind: 'NOT_SURE', benefit: null, effort: null });
 
-  it('rejects empty names', () => {
-    assert.equal(validateDisplayName('   ').ok, false);
-  });
-
-  it('rejects names past the length limit', () => {
-    assert.equal(validateDisplayName('x'.repeat(41)).ok, false);
-    assert.equal(validateDisplayName('x'.repeat(40)).ok, true);
-  });
+// --- Requirement 6: the worked example from the brief -----------------------
+test('the brief\'s worked example: B5/E4, B3/E2, NOT_SURE', () => {
+  const stats = aggregate([rated(5, 4), rated(3, 2), notSure()]);
+  assert.equal(stats.responded, 3);
+  assert.equal(stats.rated, 2);
+  assert.equal(stats.notSure, 1);
+  assert.equal(stats.avgBenefit, 4.0);
+  assert.equal(stats.avgEffort, 3.0);
 });
 
-describe('recovery codes', () => {
-  it('generates codes of the fixed length from the safe alphabet', () => {
-    for (let i = 0; i < 500; i++) {
-      const code = generateRecoveryCode();
-      assert.equal(code.length, CODE_LENGTH);
-      assert.ok(isPlausibleRecoveryCode(code), `${code} used an unsafe character`);
-    }
-  });
-
-  it('never emits the characters people mis-read', () => {
-    const seen = new Set();
-    for (let i = 0; i < 2000; i++) for (const c of generateRecoveryCode()) seen.add(c);
-    for (const bad of ['0', 'O', '1', 'I', 'L', '5', 'S', '2', 'Z', '8', 'B']) {
-      // B is allowed; the rest are not. Guard only the excluded set.
-      if (bad === 'B') continue;
-      assert.ok(!seen.has(bad), `alphabet leaked ${bad}`);
-    }
-  });
-
-  it('forgives lower case and punctuation when resuming', () => {
-    assert.equal(normaliseRecoveryCode(' k7m4q '), 'K7M4Q');
-    assert.equal(normaliseRecoveryCode('k7-m4q'), 'K7M4Q');
-  });
-
-  it('rejects codes of the wrong shape', () => {
-    assert.equal(isPlausibleRecoveryCode('K7M4'), false);
-    assert.equal(isPlausibleRecoveryCode('K7M40'), false); // 0 is not in the alphabet
-  });
+// --- Requirement 5 ----------------------------------------------------------
+test('NOT_SURE counts toward Responded but not Rated', () => {
+  const stats = aggregate([notSure(), notSure()]);
+  assert.equal(stats.responded, 2);
+  assert.equal(stats.rated, 0);
+  assert.equal(stats.notSure, 2);
 });
 
-describe('result maths', () => {
-  it('places points in the right quadrant around the 5.5 midpoint', () => {
-    assert.equal(quadrantKey(9, 9), 'high-high');
-    assert.equal(quadrantKey(2, 9), 'low-high');
-    assert.equal(quadrantKey(9, 2), 'high-low');
-    assert.equal(quadrantKey(5, 5), 'low-low');
-    assert.equal(quadrantKey(5.5, 5.5), 'high-high');
-  });
+// --- Requirement 6 ----------------------------------------------------------
+test('averages ignore NOT_SURE entirely', () => {
+  const withoutAbstainers = aggregate([rated(4, 2), rated(2, 4)]);
+  const withAbstainers = aggregate([rated(4, 2), rated(2, 4), notSure(), notSure(), notSure()]);
+  assert.equal(withAbstainers.avgBenefit, withoutAbstainers.avgBenefit);
+  assert.equal(withAbstainers.avgEffort, withoutAbstainers.avgEffort);
+  assert.equal(withAbstainers.responded, 5);
+  assert.equal(withAbstainers.rated, 2);
+});
 
-  it('takes the median of an even-length series', () => {
-    assert.equal(median([1, 2, 3, 4]), 2.5);
-    assert.equal(median([3, 1, 2]), 2);
-    assert.equal(median([]), null);
-  });
+// --- Requirement 10 ---------------------------------------------------------
+test('zero RATED responses gives null averages and no dot on the dashboard', () => {
+  const strategies = [
+    { id: 'a', title: 'Scored', description: '', archived_at: null },
+    { id: 'b', title: 'Nobody rated', description: '', archived_at: null },
+    { id: 'c', title: 'Only unsure', description: '', archived_at: null },
+  ];
+  const responses = [
+    { strategy_id: 'a', participant_id: 'p1', kind: 'RATED', benefit: 4, effort: 2 },
+    { strategy_id: 'c', participant_id: 'p1', kind: 'NOT_SURE', benefit: null, effort: null },
+  ];
+  const results = buildStrategyResults(strategies, responses);
+  const byId = Object.fromEntries(results.map((r) => [r.id, r]));
 
-  it('collapses duplicate coordinates into counted dots rather than jittering', () => {
-    const points = clusterPoints([
-      { x: 3, y: 4 }, { x: 3, y: 4 }, { x: 3, y: 4 }, { x: 8, y: 2 },
-    ]);
-    assert.deepEqual(points, [
-      { x: 3, y: 4, count: 3 },
-      { x: 8, y: 2, count: 1 },
-    ]);
-  });
+  assert.equal(byId.b.avgBenefit, null);
+  assert.equal(byId.b.avgEffort, null);
+  assert.equal(byId.c.avgBenefit, null, 'NOT_SURE alone must not produce an average');
+  assert.equal(byId.c.responded, 1);
+  assert.equal(byId.c.rated, 0);
 
-  it('reports zero dispersion when the room agrees exactly', () => {
-    assert.equal(dispersion([{ x: 5, y: 5 }, { x: 5, y: 5 }], { x: 5, y: 5 }), 0);
-  });
+  assert.deepEqual(dashboardPoints(results).map((s) => s.id), ['a']);
+  assert.deepEqual(unplottedStrategies(results).map((s) => s.id).sort(), ['b', 'c']);
+});
 
-  it('flags a strategy as contested only when opinion is genuinely split', () => {
-    const strategies = [{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }];
-    const votes = [
-      // A: everyone agrees
-      { strategy_id: 'a', participant_id: 'p1', x_score: 8, y_score: 8 },
-      { strategy_id: 'a', participant_id: 'p2', x_score: 8, y_score: 9 },
-      { strategy_id: 'a', participant_id: 'p3', x_score: 7, y_score: 8 },
-      // B: two camps
-      { strategy_id: 'b', participant_id: 'p1', x_score: 1, y_score: 1 },
-      { strategy_id: 'b', participant_id: 'p2', x_score: 10, y_score: 10 },
-      { strategy_id: 'b', participant_id: 'p3', x_score: 1, y_score: 10 },
-    ];
-    const [a, b] = buildResults(strategies, votes);
-    assert.equal(a.contested, false);
-    assert.equal(b.contested, true);
-    assert.equal(a.voteCount, 3);
-  });
+test('archived strategies are kept out of the dashboard but can be asked for', () => {
+  const strategies = [
+    { id: 'a', title: 'Live', description: '', archived_at: null },
+    { id: 'z', title: 'Archived', description: '', archived_at: new Date().toISOString() },
+  ];
+  const responses = [
+    { strategy_id: 'a', participant_id: 'p1', kind: 'RATED', benefit: 4, effort: 2 },
+    { strategy_id: 'z', participant_id: 'p1', kind: 'RATED', benefit: 5, effort: 5 },
+  ];
+  const results = buildStrategyResults(strategies, responses);
+  assert.deepEqual(dashboardPoints(results).map((s) => s.id), ['a']);
+  assert.deepEqual(dashboardPoints(results, { includeArchived: true }).map((s) => s.id), ['a', 'z']);
+  // The archived strategy's aggregate survives, it is just not plotted.
+  assert.equal(results.find((s) => s.id === 'z').avgBenefit, 5);
+});
 
-  it('never attaches a participant id to a plotted point', () => {
-    const [only] = buildResults(
-      [{ id: 'a', title: 'A' }],
-      [{ strategy_id: 'a', participant_id: 'secret-person', x_score: 5, y_score: 5 }],
-    );
-    assert.deepEqual(Object.keys(only.points[0]).sort(), ['count', 'x', 'y']);
-    assert.ok(!JSON.stringify(only).includes('secret-person'));
-  });
+// --- Requirement 7 ----------------------------------------------------------
+test('ratings accept only whole numbers 1-5', () => {
+  for (const good of [1, 2, 3, 4, 5]) assert.equal(isValidScore(good), true, `${good} should be valid`);
+  for (const bad of [0, 6, -1, 2.5, NaN, Infinity, '3', null, undefined, true]) {
+    assert.equal(isValidScore(bad), false, `${String(bad)} should be rejected`);
+  }
+});
 
-  it('handles a strategy with no votes without dividing by zero', () => {
-    const [only] = buildResults([{ id: 'a', title: 'A' }], []);
-    assert.equal(only.voteCount, 0);
-    assert.equal(only.mean.x, null);
-    assert.equal(only.quadrant, null);
-    assert.deepEqual(only.points, []);
-  });
+test('normalizeResponseInput rejects out-of-range and non-integer scores', () => {
+  assert.deepEqual(normalizeResponseInput({ kind: 'RATED', benefit: 3, effort: 5 }),
+    { kind: 'RATED', benefit: 3, effort: 5 });
 
-  it('counts responded and completed participants separately', () => {
-    const stats = summariseParticipation(
-      [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }],
-      [
-        { participant_id: 'p1', strategy_id: 'a' },
-        { participant_id: 'p1', strategy_id: 'b' },
-        { participant_id: 'p2', strategy_id: 'a' },
-      ],
-      2,
-    );
-    assert.deepEqual(stats, {
-      participantCount: 3,
-      respondedCount: 2, // p3 never voted
-      completedCount: 1, // only p1 scored both
-      strategyCount: 2,
-      totalVotes: 3,
-    });
-  });
+  for (const bad of [{ benefit: 0, effort: 3 }, { benefit: 6, effort: 3 }, { benefit: 3, effort: 0 },
+                     { benefit: 3, effort: 6 }, { benefit: 2.5, effort: 3 }, { benefit: '4', effort: 3 }]) {
+    assert.throws(() => normalizeResponseInput({ kind: 'RATED', ...bad }), /Benefit|Effort/);
+  }
+  assert.throws(() => normalizeResponseInput({ kind: 'MAYBE' }), /kind must be/);
+});
+
+test('NOT_SURE drops any scores sent alongside it', () => {
+  assert.deepEqual(normalizeResponseInput({ kind: 'NOT_SURE', benefit: 5, effort: 5 }),
+    { kind: 'NOT_SURE', benefit: null, effort: null });
+});
+
+// --- quadrants --------------------------------------------------------------
+test('quadrants split at the midpoint, and are null without an average', () => {
+  assert.equal(quadrantOf(5, 1), 'QUICK_WIN');
+  assert.equal(quadrantOf(5, 5), 'BIG_BET');
+  assert.equal(quadrantOf(1, 1), 'FILL_IN');
+  assert.equal(quadrantOf(1, 5), 'AVOID');
+  assert.equal(quadrantOf(3, 3), 'BIG_BET', 'a tie at the midpoint counts as high on both axes');
+  assert.equal(quadrantOf(null, null), null);
+});
+
+// --- participant progress ---------------------------------------------------
+test('progress counts responses against live strategies only', () => {
+  const participants = [
+    { id: 'p1', display_name: 'Quoc Duy', recovery_code: 'K7M4Q', joined_at: '2026-01-01' },
+    { id: 'p2', display_name: 'Quoc Duy', recovery_code: 'R3TDF', joined_at: '2026-01-02' },
+  ];
+  const responses = [
+    { participant_id: 'p1', strategy_id: 'a', kind: 'RATED', benefit: 3, effort: 3 },
+    { participant_id: 'p1', strategy_id: 'b', kind: 'NOT_SURE', benefit: null, effort: null },
+    { participant_id: 'p1', strategy_id: 'gone', kind: 'RATED', benefit: 3, effort: 3 },
+  ];
+  const progress = participantProgress(participants, responses, ['a', 'b']);
+  assert.deepEqual(progress.map((p) => [p.id, p.responded, p.total]), [['p1', 2, 2], ['p2', 0, 2]]);
+  // Two people called "Quoc Duy" stay two rows.
+  assert.equal(new Set(progress.map((p) => p.id)).size, 2);
+});
+
+// --- identity ---------------------------------------------------------------
+test('display names are trimmed and bounded, never deduplicated', () => {
+  assert.equal(normalizeDisplayName('  Quoc   Duy '), 'Quoc Duy');
+  assert.throws(() => normalizeDisplayName('   '), /Enter a name/);
+  assert.throws(() => normalizeDisplayName('x'.repeat(41)), /under 40/);
+});
+
+test('recovery codes avoid characters people misread', () => {
+  for (let i = 0; i < 200; i++) {
+    const code = newRecoveryCode();
+    assert.equal(code.length, RECOVERY_CODE_LENGTH);
+    assert.match(code, /^[34679ACDEFGHJKMNPQRTUVWXY]+$/);
+  }
 });

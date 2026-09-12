@@ -1,15 +1,15 @@
-import { openDb } from './db.js';
 import { createApp } from './app.js';
-import { configuredPasscode, DEV_PASSCODE } from './auth.js';
+import { DEFAULT_PASSCODE, adminPasscode } from './auth.js';
 
-const port = Number(process.env.PORT ?? 3001);
-const db = openDb();
-const app = createApp(db);
+const port = Number(process.env.PORT) || 3001;
 
-app.listen(port, () => {
-  console.log(`Voting platform API listening on http://localhost:${port}`);
-  if (configuredPasscode() === DEV_PASSCODE) {
-    console.log(`Admin passcode is the development default: "${DEV_PASSCODE}"`);
-    console.log('Set ADMIN_PASSCODE in the environment before using this anywhere real.');
-  }
+if (adminPasscode() === DEFAULT_PASSCODE) {
+  console.warn(`[warn] ADMIN_PASSCODE is unset -- using the default "${DEFAULT_PASSCODE}".`);
+}
+if (!process.env.DATABASE_URL && !process.env.DB_DIR) {
+  console.warn('[warn] No DATABASE_URL or DB_DIR -- running on an in-memory database. Data is lost on restart.');
+}
+
+createApp().listen(port, () => {
+  console.log(`Strategy voting on http://localhost:${port}`);
 });

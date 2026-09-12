@@ -1,260 +1,194 @@
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { after, before, describe, it } from 'node:test';
-import { createApp } from '../server/app.js';
-import { openDb } from '../server/db.js';
+import { startServer, asAdmin, asParticipant } from './helpers.js';
 
 process.env.ADMIN_PASSCODE = 'test-passcode';
 
-let server;
-let base;
-let db;
+const ADMIN_ROUTES = [
+  ['POST', '/api/admin/logout'],
+  ['GET', '/api/admin/overview'],
+  ['POST', '/api/admin/strategies'],
+  ['PATCH', '/api/admin/strategies/anything'],
+  ['POST', '/api/admin/strategies/anything/archive'],
+  ['POST', '/api/admin/strategies/anything/restore'],
+  ['POST', '/api/admin/session/status'],
+  ['POST', '/api/admin/clear-responses'],
+];
 
-const call = async (path, { method = 'GET', body, participantId, adminToken } = {}) => {
-  const headers = {};
-  if (body !== undefined) headers['content-type'] = 'application/json';
-  if (participantId) headers['x-participant-id'] = participantId;
-  if (adminToken) headers.authorization = `Bearer ${adminToken}`;
-  const res = await fetch(base + path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  return { status: res.status, body: await res.json().catch(() => null) };
-};
+async function signedIn(api) {
+  const res = await api.call('POST', '/api/admin/login', { body: { passcode: 'test-passcode' } });
+  assert.equal(res.status, 200);
+  return res.body.token;
+}
 
-const adminLogin = async () => (await call('/api/admin/login', {
-  method: 'POST', body: { passcode: 'test-passcode' },
-})).body.token;
+// --- Requirement 9 ----------------------------------------------------------
+test('participants cannot reach admin data or actions', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
 
-const addStrategy = async (token, title) =>
-  (await call('/api/admin/strategies', { method: 'POST', adminToken: token, body: { title } })).body;
+  const join = await api.call('POST', '/api/join', { body: { displayName: 'Nosy' } });
+  const participant = join.body;
 
-before(async () => {
-  db = openDb(':memory:');
-  server = createApp(db).listen(0);
-  await new Promise((resolve) => server.once('listening', resolve));
-  base = `http://127.0.0.1:${server.address().port}`;
+  for (const [method, path] of ADMIN_ROUTES) {
+    // No credentials at all.
+    assert.equal((await api.call(method, path, { body: {} })).status, 401, `${method} ${path} unauthenticated`);
+
+    // A valid participant id is not admin authority.
+    const asPart = await api.call(method, path, { body: {}, headers: asParticipant(participant.id) });
+    assert.equal(asPart.status, 401, `${method} ${path} with a participant id`);
+
+    // A made-up bearer token.
+    const forged = await api.call(method, path, { body: {}, headers: asAdmin('forged-token-value') });
+    assert.equal(forged.status, 401, `${method} ${path} with a forged token`);
+  }
 });
 
-after(() => server.close());
+test('a revoked admin token stops working immediately', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
 
-describe('participant identity', () => {
-  it('joins with nothing but a display name', async () => {
-    const { status, body } = await call('/api/participants', {
-      method: 'POST', body: { displayName: 'Quoc Duy' },
-    });
-    assert.equal(status, 201);
-    assert.match(body.id, /^[0-9a-f-]{36}$/);
-    assert.equal(body.displayName, 'Quoc Duy');
-    assert.equal(body.recoveryCode.length, 5);
-  });
+  const token = await signedIn(api);
+  assert.equal((await api.call('GET', '/api/admin/overview', { headers: asAdmin(token) })).status, 200);
 
-  it('rejects an empty name', async () => {
-    const { status } = await call('/api/participants', { method: 'POST', body: { displayName: '  ' } });
-    assert.equal(status, 400);
-  });
+  await api.call('POST', '/api/admin/logout', { headers: asAdmin(token) });
 
-  it('gives two people with the SAME display name different identities', async () => {
-    const a = (await call('/api/participants', { method: 'POST', body: { displayName: 'Alex' } })).body;
-    const b = (await call('/api/participants', { method: 'POST', body: { displayName: 'Alex' } })).body;
-    assert.notEqual(a.id, b.id);
-    assert.notEqual(a.recoveryCode, b.recoveryCode);
-  });
-
-  it('restores an identity from the stored uuid', async () => {
-    const joined = (await call('/api/participants', { method: 'POST', body: { displayName: 'Returner' } })).body;
-    const { status, body } = await call(`/api/participants/${joined.id}`);
-    assert.equal(status, 200);
-    assert.equal(body.id, joined.id);
-  });
-
-  it('404s an unknown uuid so a stale browser falls back to the join screen', async () => {
-    const { status } = await call('/api/participants/11111111-2222-3333-4444-555555555555');
-    assert.equal(status, 404);
-  });
-
-  it('resumes from the recovery code, case-insensitively', async () => {
-    const joined = (await call('/api/participants', { method: 'POST', body: { displayName: 'Roamer' } })).body;
-    const { status, body } = await call('/api/participants/resume', {
-      method: 'POST', body: { recoveryCode: joined.recoveryCode.toLowerCase() },
-    });
-    assert.equal(status, 200);
-    assert.equal(body.id, joined.id);
-  });
-
-  it('rejects an unknown or malformed recovery code', async () => {
-    assert.equal((await call('/api/participants/resume', { method: 'POST', body: { recoveryCode: 'nope' } })).status, 400);
-    assert.equal((await call('/api/participants/resume', { method: 'POST', body: { recoveryCode: 'QQQQQ' } })).status, 404);
-  });
+  for (const [method, path] of ADMIN_ROUTES) {
+    const res = await api.call(method, path, { body: {}, headers: asAdmin(token) });
+    assert.equal(res.status, 401, `${method} ${path} after logout`);
+  }
 });
 
-describe('renaming keeps the identity', () => {
-  it('changes the label without creating a second participant or losing votes', async () => {
-    const token = await adminLogin();
-    const strategy = await addStrategy(token, 'Rename test strategy');
-    const person = (await call('/api/participants', { method: 'POST', body: { displayName: 'Before' } })).body;
+test('the wrong passcode does not issue a token', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
 
-    await call(`/api/votes/${strategy.id}`, { method: 'PUT', participantId: person.id, body: { x: 7, y: 8 } });
-
-    const renamed = (await call(`/api/participants/${person.id}`, {
-      method: 'PATCH', body: { displayName: 'After' },
-    })).body;
-
-    assert.equal(renamed.id, person.id, 'identity must survive a rename');
-    assert.equal(renamed.displayName, 'After');
-    assert.equal(renamed.recoveryCode, person.recoveryCode);
-
-    const mine = (await call('/api/votes/mine', { participantId: person.id })).body;
-    assert.equal(mine.length, 1);
-    assert.deepEqual([mine[0].x, mine[0].y], [7, 8]);
-  });
+  const bad = await api.call('POST', '/api/admin/login', { body: { passcode: 'guess' } });
+  assert.equal(bad.status, 401);
+  assert.equal(bad.body.token, undefined);
 });
 
-describe('voting', () => {
-  it('refuses a vote from an unknown participant', async () => {
-    const token = await adminLogin();
-    const strategy = await addStrategy(token, 'Auth check');
-    const { status } = await call(`/api/votes/${strategy.id}`, {
-      method: 'PUT', participantId: 'not-a-real-id', body: { x: 1, y: 1 },
-    });
-    assert.equal(status, 401);
+// --- anonymity --------------------------------------------------------------
+test('public results carry aggregates only, never participant identities', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
+
+  const token = await signedIn(api);
+  const strategy = (await api.call('POST', '/api/admin/strategies', {
+    body: { title: 'Self-service kiosks' }, headers: asAdmin(token),
+  })).body;
+
+  const alice = (await api.call('POST', '/api/join', { body: { displayName: 'Alice' } })).body;
+  await api.call('PUT', `/api/responses/${strategy.id}`, {
+    body: { kind: 'RATED', benefit: 4, effort: 2 }, headers: asParticipant(alice.id),
   });
 
-  it('keeps exactly one row per participant per strategy when a vote changes', async () => {
-    const token = await adminLogin();
-    const strategy = await addStrategy(token, 'Upsert check');
-    const person = (await call('/api/participants', { method: 'POST', body: { displayName: 'Voter' } })).body;
+  const results = await api.call('GET', '/api/results');
+  assert.equal(results.status, 200);
 
-    for (const vote of [{ x: 1, y: 1 }, { x: 5, y: 5 }, { x: 9, y: 2 }]) {
-      await call(`/api/votes/${strategy.id}`, { method: 'PUT', participantId: person.id, body: vote });
-    }
-
-    const rows = db
-      .prepare('SELECT COUNT(*) AS n FROM votes WHERE participant_id = ? AND strategy_id = ?')
-      .get(person.id, strategy.id);
-    assert.equal(rows.n, 1, 'the UNIQUE constraint must collapse re-votes into one row');
-
-    const mine = (await call('/api/votes/mine', { participantId: person.id })).body;
-    const vote = mine.find((v) => v.strategyId === strategy.id);
-    assert.deepEqual([vote.x, vote.y], [9, 2]);
-  });
-
-  it('rejects scores outside the scale and non-integers', async () => {
-    const token = await adminLogin();
-    const strategy = await addStrategy(token, 'Scale check');
-    const person = (await call('/api/participants', { method: 'POST', body: { displayName: 'Cheater' } })).body;
-
-    for (const bad of [{ x: 0, y: 5 }, { x: 11, y: 5 }, { x: 5, y: -3 }, { x: 5.5, y: 5 }, { x: 'abc', y: 5 }]) {
-      const { status } = await call(`/api/votes/${strategy.id}`, {
-        method: 'PUT', participantId: person.id, body: bad,
-      });
-      assert.equal(status, 400, `expected ${JSON.stringify(bad)} to be rejected`);
-    }
-  });
-
-  it('404s a vote on a strategy that does not exist', async () => {
-    const person = (await call('/api/participants', { method: 'POST', body: { displayName: 'Lost' } })).body;
-    const { status } = await call('/api/votes/no-such-strategy', {
-      method: 'PUT', participantId: person.id, body: { x: 5, y: 5 },
-    });
-    assert.equal(status, 404);
-  });
+  const serialised = JSON.stringify(results.body);
+  assert.ok(!serialised.includes(alice.id), 'no participant id in the results payload');
+  assert.ok(!serialised.includes(alice.recoveryCode), 'no recovery code in the results payload');
+  assert.ok(!serialised.includes('Alice'), 'no display name in the results payload');
+  assert.equal(results.body.plotted[0].avgBenefit, 4);
+  assert.equal(results.body.participantCount, 1);
 });
 
-describe('admin authorisation is server-side', () => {
-  const adminPaths = [
-    ['GET', '/api/admin/participants'],
-    ['GET', '/api/admin/strategies'],
-    ['POST', '/api/admin/strategies'],
-    ['PATCH', '/api/admin/settings'],
-    ['POST', '/api/admin/votes/reset'],
-    ['GET', '/api/admin/results'],
-  ];
+test('the admin roster does show names, join time, progress and recovery codes', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
 
-  it('401s every admin route without a token', async () => {
-    for (const [method, path] of adminPaths) {
-      const { status } = await call(path, { method, body: method === 'GET' ? undefined : {} });
-      assert.equal(status, 401, `${method} ${path} was not protected`);
-    }
+  const token = await signedIn(api);
+  await api.call('POST', '/api/admin/strategies', { body: { title: 'A' }, headers: asAdmin(token) });
+  await api.call('POST', '/api/admin/strategies', { body: { title: 'B' }, headers: asAdmin(token) });
+  const alice = (await api.call('POST', '/api/join', { body: { displayName: 'Alice' } })).body;
+  const strategies = (await api.call('GET', '/api/ballot', { headers: asParticipant(alice.id) })).body.strategies;
+  await api.call('PUT', `/api/responses/${strategies[0].id}`, {
+    body: { kind: 'NOT_SURE' }, headers: asParticipant(alice.id),
   });
 
-  it('401s a forged token', async () => {
-    const { status } = await call('/api/admin/participants', { adminToken: 'made-up-token' });
-    assert.equal(status, 401);
-  });
-
-  it('rejects a wrong passcode', async () => {
-    const { status } = await call('/api/admin/login', { method: 'POST', body: { passcode: 'wrong' } });
-    assert.equal(status, 401);
-  });
-
-  it('stops honouring a token after logout', async () => {
-    const token = await adminLogin();
-    assert.equal((await call('/api/admin/participants', { adminToken: token })).status, 200);
-    await call('/api/admin/logout', { method: 'POST', adminToken: token });
-    assert.equal((await call('/api/admin/participants', { adminToken: token })).status, 401);
-  });
+  const overview = (await api.call('GET', '/api/admin/overview', { headers: asAdmin(token) })).body;
+  const row = overview.participants[0];
+  assert.equal(row.displayName, 'Alice');
+  assert.equal(row.recoveryCode, alice.recoveryCode);
+  assert.equal(row.responded, 1);
+  assert.equal(row.total, 2);
+  assert.ok(row.joinedAt, 'join time is shown');
 });
 
-describe('admin views', () => {
-  it('lists participants with join time, progress and recovery code', async () => {
-    const token = await adminLogin();
-    const { body } = await call('/api/admin/participants', { adminToken: token });
-    const sample = body.participants[0];
-    assert.ok(sample.displayName);
-    assert.ok(sample.joinedAt);
-    assert.equal(typeof sample.votesCast, 'number');
-    assert.equal(sample.recoveryCode.length, 5);
-  });
+// --- participant flow over HTTP --------------------------------------------
+test('joining, voting and changing a vote over HTTP', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
 
-  it('cascades votes away when a participant is removed', async () => {
-    const token = await adminLogin();
-    const strategy = await addStrategy(token, 'Cascade check');
-    const person = (await call('/api/participants', { method: 'POST', body: { displayName: 'Temp' } })).body;
-    await call(`/api/votes/${strategy.id}`, { method: 'PUT', participantId: person.id, body: { x: 4, y: 4 } });
+  const token = await signedIn(api);
+  const strategy = (await api.call('POST', '/api/admin/strategies', {
+    body: { title: 'Extend opening hours' }, headers: asAdmin(token),
+  })).body;
 
-    await call(`/api/admin/participants/${person.id}`, { method: 'DELETE', adminToken: token });
+  const joined = await api.call('POST', '/api/join', { body: { displayName: '  Quoc  Duy ' } });
+  assert.equal(joined.status, 201);
+  assert.equal(joined.body.displayName, 'Quoc Duy');
+  assert.match(joined.body.recoveryCode, /^[34679ACDEFGHJKMNPQRTUVWXY]{5}$/);
+  const me = asParticipant(joined.body.id);
 
-    const left = db.prepare('SELECT COUNT(*) AS n FROM votes WHERE participant_id = ?').get(person.id);
-    assert.equal(left.n, 0);
-  });
+  assert.equal((await api.call('POST', '/api/join', { body: { displayName: '' } })).status, 400);
+
+  const vote = (body) => api.call('PUT', `/api/responses/${strategy.id}`, { body, headers: me });
+
+  assert.equal((await vote({ kind: 'RATED', benefit: 4, effort: 2 })).status, 200);
+  assert.equal((await vote({ kind: 'RATED', benefit: 5, effort: 1 })).status, 200);
+  assert.equal((await vote({ kind: 'NOT_SURE' })).status, 200);
+
+  // Requirement 7 over the wire.
+  for (const bad of [{ benefit: 0, effort: 3 }, { benefit: 6, effort: 3 }, { benefit: 2.5, effort: 3 },
+                     { benefit: '4', effort: 3 }, { benefit: null, effort: 3 }]) {
+    const res = await vote({ kind: 'RATED', ...bad });
+    assert.equal(res.status, 400, `${JSON.stringify(bad)} must be rejected`);
+  }
+
+  const ballot = (await api.call('GET', '/api/ballot', { headers: me })).body;
+  assert.equal(ballot.responses.length, 1);
+  assert.equal(ballot.responses[0].kind, 'NOT_SURE');
 });
 
-describe('results', () => {
-  it('aggregates votes without exposing who cast them', async () => {
-    const token = await adminLogin();
-    const strategy = await addStrategy(token, 'Anonymity check');
-    const people = [];
-    for (const name of ['P1', 'P2', 'P3']) {
-      people.push((await call('/api/participants', { method: 'POST', body: { displayName: name } })).body);
-    }
-    for (const [i, person] of people.entries()) {
-      await call(`/api/votes/${strategy.id}`, {
-        method: 'PUT', participantId: person.id, body: { x: 8, y: 7 + (i % 2) },
-      });
-    }
+test('an unknown participant id cannot vote or read a ballot', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
 
-    const { body } = await call('/api/results');
-    const raw = JSON.stringify(body);
-    for (const person of people) {
-      assert.ok(!raw.includes(person.id), 'results leaked a participant id');
-      assert.ok(!raw.includes(person.recoveryCode), 'results leaked a recovery code');
-    }
+  const token = await signedIn(api);
+  const strategy = (await api.call('POST', '/api/admin/strategies', {
+    body: { title: 'X' }, headers: asAdmin(token),
+  })).body;
 
-    const entry = body.strategies.find((s) => s.id === strategy.id);
-    assert.equal(entry.voteCount, 3);
-    assert.equal(entry.mean.x, 8);
+  assert.equal((await api.call('GET', '/api/ballot')).status, 403);
+  const ghost = asParticipant('11111111-2222-3333-4444-555555555555');
+  assert.equal((await api.call('GET', '/api/ballot', { headers: ghost })).status, 403);
+  assert.equal((await api.call('PUT', `/api/responses/${strategy.id}`, {
+    body: { kind: 'RATED', benefit: 3, effort: 3 }, headers: ghost,
+  })).status, 403);
+});
+
+// --- Requirement 8 over HTTP ------------------------------------------------
+test('locking the session rejects participant writes over HTTP', async (t) => {
+  const api = await startServer();
+  t.after(() => api.close());
+
+  const token = await signedIn(api);
+  const strategy = (await api.call('POST', '/api/admin/strategies', {
+    body: { title: 'Loyalty scheme' }, headers: asAdmin(token),
+  })).body;
+  const me = asParticipant((await api.call('POST', '/api/join', { body: { displayName: 'Voter' } })).body.id);
+  await api.call('PUT', `/api/responses/${strategy.id}`, { body: { kind: 'RATED', benefit: 2, effort: 2 }, headers: me });
+
+  await api.call('POST', '/api/admin/session/status', { body: { status: 'LOCKED' }, headers: asAdmin(token) });
+
+  const blocked = await api.call('PUT', `/api/responses/${strategy.id}`, {
+    body: { kind: 'RATED', benefit: 5, effort: 5 }, headers: me,
   });
+  assert.equal(blocked.status, 403);
+  assert.equal(blocked.body.error, 'voting_locked');
 
-  it('clears votes on reset but keeps participants and strategies', async () => {
-    const token = await adminLogin();
-    const before = (await call('/api/admin/participants', { adminToken: token })).body.participants.length;
-
-    await call('/api/admin/votes/reset', { method: 'POST', adminToken: token });
-
-    const after = (await call('/api/admin/participants', { adminToken: token })).body;
-    assert.equal(after.participants.length, before);
-    assert.equal(after.participation.totalVotes, 0);
-    assert.ok((await call('/api/strategies')).body.length > 0);
-  });
+  const ballot = (await api.call('GET', '/api/ballot', { headers: me })).body;
+  assert.equal(ballot.session.status, 'LOCKED');
+  assert.equal(ballot.responses[0].benefit, 2, 'the earlier vote is unchanged');
 });

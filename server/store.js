@@ -1,214 +1,137 @@
 import { randomUUID } from 'node:crypto';
-import { generateRecoveryCode, newParticipantId } from './domain/identity.js';
+import { newParticipantId, newRecoveryCode } from './domain/identity.js';
 
 /**
- * All SQL lives here. Every function takes the db handle first so routes and
- * tests can share one implementation against different databases.
+ * Every SQL statement in the app lives here, one function per operation.
+ * Business rules live in domain/ and service.js; this file only reads and writes.
  */
+export function createStore(db) {
+  const one = async (text, params) => (await db.query(text, params)).rows[0] ?? null;
+  const all = async (text, params) => (await db.query(text, params)).rows;
 
-const isUniqueViolation = (err) =>
-  typeof err?.code === 'string' && err.code.startsWith('SQLITE_CONSTRAINT');
+  return {
+    // ---- session -------------------------------------------------------
+    getSession: (id) => one(`SELECT * FROM voting_sessions WHERE id = $1`, [id]),
 
-/* ------------------------------- participants ---------------------------- */
+    setSessionStatus: (id, status) =>
+      one(`UPDATE voting_sessions SET status = $2 WHERE id = $1 RETURNING *`, [id, status]),
 
-const participantColumns = `
-  id, display_name AS displayName, recovery_code AS recoveryCode,
-  joined_at AS joinedAt, last_seen_at AS lastSeenAt`;
+    // ---- participants --------------------------------------------------
+    /** Retries on the (very unlikely) recovery-code collision the UNIQUE index catches. */
+    async createParticipant(sessionId, displayName) {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          return await one(
+            `INSERT INTO participants (id, session_id, display_name, recovery_code)
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [newParticipantId(), sessionId, displayName, newRecoveryCode()],
+          );
+        } catch (err) {
+          if (!/unique|duplicate/i.test(String(err?.message))) throw err;
+        }
+      }
+      throw new Error('Could not allocate a unique recovery code.');
+    },
 
-export function getParticipant(db, id) {
-  return db.prepare(`SELECT ${participantColumns} FROM participants WHERE id = ?`).get(id);
-}
+    getParticipant: (id) => one(`SELECT * FROM participants WHERE id = $1`, [id]),
 
-export function getParticipantByCode(db, code) {
-  return db
-    .prepare(`SELECT ${participantColumns} FROM participants WHERE recovery_code = ?`)
-    .get(code);
-}
+    getParticipantByRecoveryCode: (sessionId, code) =>
+      one(`SELECT * FROM participants WHERE session_id = $1 AND recovery_code = $2`, [sessionId, code]),
 
-/**
- * Creates a brand-new identity. The UUID is the identity; the display name is
- * only a label, so we never look for an existing row by name.
- */
-export function createParticipant(db, displayName) {
-  const insert = db.prepare(
-    'INSERT INTO participants (id, display_name, recovery_code) VALUES (?, ?, ?)',
-  );
-  // Recovery codes are short, so a collision is unlikely but not impossible.
-  // The UNIQUE constraint is what actually guarantees uniqueness; we just retry.
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const id = newParticipantId();
-    const code = generateRecoveryCode();
-    try {
-      insert.run(id, displayName, code);
-      return getParticipant(db, id);
-    } catch (err) {
-      if (isUniqueViolation(err)) continue;
-      throw err;
-    }
-  }
-  throw new Error('Could not allocate a unique recovery code');
-}
+    /** Renaming keeps the same row: the UUID, and therefore every vote, survives. */
+    renameParticipant: (id, displayName) =>
+      one(`UPDATE participants SET display_name = $2 WHERE id = $1 RETURNING *`, [id, displayName]),
 
-/** Renaming changes the label only -- the identity (and therefore votes) stays. */
-export function renameParticipant(db, id, displayName) {
-  db.prepare('UPDATE participants SET display_name = ? WHERE id = ?').run(displayName, id);
-  return getParticipant(db, id);
-}
+    listParticipants: (sessionId) =>
+      all(`SELECT * FROM participants WHERE session_id = $1 ORDER BY joined_at ASC`, [sessionId]),
 
-export function touchParticipant(db, id) {
-  db.prepare(
-    "UPDATE participants SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
-  ).run(id);
-}
+    // ---- strategies ----------------------------------------------------
+    async createStrategy(sessionId, { title, description = '' }) {
+      const { rows } = await db.query(
+        `SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM strategies WHERE session_id = $1`,
+        [sessionId],
+      );
+      return one(
+        `INSERT INTO strategies (id, session_id, title, description, sort_order)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+        [randomUUID(), sessionId, title, description, rows[0].next],
+      );
+    },
 
-export function deleteParticipant(db, id) {
-  return db.prepare('DELETE FROM participants WHERE id = ?').run(id).changes > 0;
-}
+    updateStrategy: (id, { title, description }) =>
+      one(
+        `UPDATE strategies SET title = COALESCE($2, title), description = COALESCE($3, description)
+         WHERE id = $1 RETURNING *`,
+        [id, title ?? null, description ?? null],
+      ),
 
-/** Admin roster: identity, label, join time and progress in one query. */
-export function listParticipantsWithProgress(db) {
-  return db
-    .prepare(
-      `SELECT p.id,
-              p.display_name  AS displayName,
-              p.recovery_code AS recoveryCode,
-              p.joined_at     AS joinedAt,
-              p.last_seen_at  AS lastSeenAt,
-              COUNT(v.id)     AS votesCast
-         FROM participants p
-         LEFT JOIN votes v ON v.participant_id = p.id
-        GROUP BY p.id
-        ORDER BY p.joined_at ASC`,
-    )
-    .all();
-}
+    /** Soft delete only. Responses are deliberately left untouched. */
+    setStrategyArchived: (id, archived) =>
+      one(
+        `UPDATE strategies SET archived_at = ${archived ? 'now()' : 'NULL'} WHERE id = $1 RETURNING *`,
+        [id],
+      ),
 
-/* -------------------------------- strategies ----------------------------- */
+    getStrategy: (id) => one(`SELECT * FROM strategies WHERE id = $1`, [id]),
 
-const strategyColumns = 'id, title, description, position, archived, created_at AS createdAt';
+    listStrategies: (sessionId, { includeArchived = false } = {}) =>
+      all(
+        `SELECT * FROM strategies WHERE session_id = $1
+           ${includeArchived ? '' : 'AND archived_at IS NULL'}
+         ORDER BY sort_order ASC, created_at ASC`,
+        [sessionId],
+      ),
 
-export function listStrategies(db, { includeArchived = false } = {}) {
-  const where = includeArchived ? '' : 'WHERE archived = 0';
-  return db
-    .prepare(`SELECT ${strategyColumns} FROM strategies ${where} ORDER BY position ASC, created_at ASC`)
-    .all();
-}
+    // ---- responses -----------------------------------------------------
+    /**
+     * The only write path for a vote, and the place voting rules are enforced.
+     *
+     * A single statement does all of it: the WHERE EXISTS refuses the write
+     * unless the session is OPEN and the strategy is live, and the ON CONFLICT
+     * turns a re-vote into an UPDATE of the existing row. Because the guard and
+     * the write are one statement there is no window in which a session can be
+     * locked between the check and the insert, and no path that produces a
+     * second current response for the same (participant, strategy).
+     *
+     * Returns null when the guard refused -- the caller decides what to say.
+     */
+    upsertResponse({ sessionId, participantId, strategyId, kind, benefit, effort }) {
+      return one(
+        `INSERT INTO responses (id, session_id, participant_id, strategy_id, kind, benefit, effort)
+         SELECT $1, $2, $3, $4, $5, $6, $7
+         WHERE EXISTS (
+           SELECT 1
+             FROM voting_sessions v
+             JOIN strategies s ON s.session_id = v.id
+            WHERE v.id = $2 AND v.status = 'OPEN'
+              AND s.id = $4 AND s.archived_at IS NULL
+         )
+         ON CONFLICT ON CONSTRAINT responses_one_per_participant_per_strategy
+         DO UPDATE SET kind    = EXCLUDED.kind,
+                       benefit = EXCLUDED.benefit,
+                       effort  = EXCLUDED.effort,
+                       updated_at = now()
+         RETURNING *`,
+        [randomUUID(), sessionId, participantId, strategyId, kind, benefit, effort],
+      );
+    },
 
-export function getStrategy(db, id) {
-  return db.prepare(`SELECT ${strategyColumns} FROM strategies WHERE id = ?`).get(id);
-}
+    listResponses: (sessionId) =>
+      all(`SELECT * FROM responses WHERE session_id = $1`, [sessionId]),
 
-export function createStrategy(db, { title, description = '' }) {
-  const id = randomUUID();
-  const nextPosition =
-    (db.prepare('SELECT COALESCE(MAX(position), 0) AS m FROM strategies').get().m ?? 0) + 1;
-  db.prepare(
-    'INSERT INTO strategies (id, title, description, position) VALUES (?, ?, ?, ?)',
-  ).run(id, title, description, nextPosition);
-  return getStrategy(db, id);
-}
+    listResponsesForParticipant: (participantId) =>
+      all(`SELECT * FROM responses WHERE participant_id = $1`, [participantId]),
 
-export function updateStrategy(db, id, patch) {
-  const current = getStrategy(db, id);
-  if (!current) return null;
-  const next = {
-    title: patch.title ?? current.title,
-    description: patch.description ?? current.description,
-    position: patch.position ?? current.position,
-    archived: patch.archived === undefined ? current.archived : patch.archived ? 1 : 0,
+    clearResponses: (sessionId) =>
+      db.query(`DELETE FROM responses WHERE session_id = $1`, [sessionId]),
+
+    // ---- admin tokens --------------------------------------------------
+    createAdminToken: async () => {
+      const token = randomUUID() + randomUUID().replaceAll('-', '');
+      await db.query(`INSERT INTO admin_sessions (token) VALUES ($1)`, [token]);
+      return token;
+    },
+    findAdminToken: (token) => one(`SELECT * FROM admin_sessions WHERE token = $1`, [token]),
+    deleteAdminToken: (token) => db.query(`DELETE FROM admin_sessions WHERE token = $1`, [token]),
   };
-  db.prepare(
-    'UPDATE strategies SET title = ?, description = ?, position = ?, archived = ? WHERE id = ?',
-  ).run(next.title, next.description, next.position, next.archived, id);
-  return getStrategy(db, id);
-}
-
-/** Hard delete. Votes go with it via ON DELETE CASCADE. */
-export function deleteStrategy(db, id) {
-  return db.prepare('DELETE FROM strategies WHERE id = ?').run(id).changes > 0;
-}
-
-/* ----------------------------------- votes -------------------------------- */
-
-export function listVotes(db) {
-  return db
-    .prepare('SELECT participant_id, strategy_id, x_score, y_score, comment FROM votes')
-    .all();
-}
-
-export function listVotesForParticipant(db, participantId) {
-  return db
-    .prepare(
-      `SELECT strategy_id AS strategyId, x_score AS x, y_score AS y, comment,
-              updated_at AS updatedAt
-         FROM votes WHERE participant_id = ?`,
-    )
-    .all(participantId);
-}
-
-/**
- * One row per (participant, strategy), enforced by the UNIQUE constraint.
- * Changing a vote updates that row -- it can never fan out into duplicates,
- * even if a flaky network makes the client send the same vote twice.
- */
-export function upsertVote(db, { participantId, strategyId, x, y, comment = '' }) {
-  db.prepare(
-    `INSERT INTO votes (participant_id, strategy_id, x_score, y_score, comment)
-          VALUES (@participantId, @strategyId, @x, @y, @comment)
-     ON CONFLICT (participant_id, strategy_id)
-     DO UPDATE SET x_score    = excluded.x_score,
-                   y_score    = excluded.y_score,
-                   comment    = excluded.comment,
-                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-  ).run({ participantId, strategyId, x, y, comment });
-
-  return db
-    .prepare(
-      `SELECT strategy_id AS strategyId, x_score AS x, y_score AS y, comment,
-              updated_at AS updatedAt
-         FROM votes WHERE participant_id = ? AND strategy_id = ?`,
-    )
-    .get(participantId, strategyId);
-}
-
-export function clearAllVotes(db) {
-  return db.prepare('DELETE FROM votes').run().changes;
-}
-
-/* --------------------------------- settings ------------------------------- */
-
-export function getSettings(db) {
-  return Object.fromEntries(
-    db.prepare('SELECT key, value FROM settings').all().map((r) => [r.key, r.value]),
-  );
-}
-
-export function updateSettings(db, patch) {
-  const stmt = db.prepare(
-    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
-  );
-  const run = db.transaction((entries) => {
-    for (const [key, value] of entries) stmt.run(key, String(value));
-  });
-  run(Object.entries(patch));
-  return getSettings(db);
-}
-
-/* ----------------------------- admin sessions ----------------------------- */
-
-export function createAdminSession(db, ttlHours = 12) {
-  const token = randomUUID() + randomUUID().replaceAll('-', '');
-  const expiresAt = new Date(Date.now() + ttlHours * 3600_000).toISOString();
-  db.prepare('INSERT INTO admin_sessions (token, expires_at) VALUES (?, ?)').run(token, expiresAt);
-  return { token, expiresAt };
-}
-
-export function isValidAdminSession(db, token) {
-  if (!token) return false;
-  db.prepare("DELETE FROM admin_sessions WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')").run();
-  return !!db.prepare('SELECT token FROM admin_sessions WHERE token = ?').get(token);
-}
-
-export function destroyAdminSession(db, token) {
-  db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
 }

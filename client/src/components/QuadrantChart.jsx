@@ -1,247 +1,148 @@
-import React, { useMemo, useState } from 'react';
+import React, { useState } from 'react';
 
 /**
- * Renders a 2x2 quadrant scatter. This component does NO business maths: it is
- * handed points that already carry their coordinates and labels, and it turns
- * them into pixels. Aggregation lives in server/domain/results.js.
+ * Pixels only. Every number this component draws -- averages, counts, quadrant --
+ * was computed on the server by domain/results.js. Changing what a quadrant means
+ * is an edit there, and this file picks it up without knowing.
  */
 
-const W = 660;
-const H = 496;
-// Generous top/bottom margins: the quadrant captions live OUTSIDE the plot
-// frame, because votes at the extremes sit exactly where corner labels would.
-const M = { top: 34, right: 26, bottom: 66, left: 56 };
-const PLOT = { w: W - M.left - M.right, h: H - M.top - M.bottom };
+const W = 760;
+const H = 540;
+const M = { top: 28, right: 28, bottom: 56, left: 66 };
+const PLOT_W = W - M.left - M.right;
+const PLOT_H = H - M.top - M.bottom;
 
-// Pad the domain by half a step so votes at 1 and 10 are not clipped by the frame.
-const PAD = 0.5;
-
-// Placed above and below the frame, aligned to the half they describe.
-const QUADRANT_CAPTIONS = [
-  { key: 'low-high', xf: 0.25, edge: 'top' },
-  { key: 'high-high', xf: 0.75, edge: 'top' },
-  { key: 'low-low', xf: 0.25, edge: 'bottom' },
-  { key: 'high-low', xf: 0.75, edge: 'bottom' },
+const CORNERS = [
+  { key: 'QUICK_WIN', label: 'Quick wins',  x: 'left',  y: 'top' },
+  { key: 'BIG_BET',   label: 'Big bets',    x: 'right', y: 'top' },
+  { key: 'FILL_IN',   label: 'Fill-ins',    x: 'left',  y: 'bottom' },
+  { key: 'AVOID',     label: 'Thankless',   x: 'right', y: 'bottom' },
 ];
 
-/** Keeps direct labels from sitting on top of each other. */
-function deconflict(labels, minGap = 13) {
-  const sorted = [...labels].sort((a, b) => a.y - b.y);
-  for (let i = 1; i < sorted.length; i++) {
-    const gap = sorted[i].y - sorted[i - 1].y;
-    if (gap < minGap) sorted[i].y = sorted[i - 1].y + minGap;
-  }
-  return labels;
-}
+export default function QuadrantChart({ points, min = 1, max = 5, midpoint = 3 }) {
+  const [hovered, setHovered] = useState(null);
 
-// Rough advance width for the 11px semibold label face. Good enough to decide
-// which side of a dot the label belongs on.
-const CHAR_W = 5.9;
-const LABEL_GAP = 11;
+  const pad = 0.4;
+  const lo = min - pad;
+  const hi = max + pad;
+  const sx = (v) => M.left + ((v - lo) / (hi - lo)) * PLOT_W;
+  const sy = (v) => M.top + PLOT_H - ((v - lo) / (hi - lo)) * PLOT_H;
 
-/** Puts each label on whichever side of its dot keeps it inside the frame. */
-function placeLabel(text, cx, plotLeft, plotRight) {
-  const width = text.length * CHAR_W;
-  if (cx + LABEL_GAP + width <= plotRight) {
-    return { x: cx + LABEL_GAP, anchor: 'start' };
-  }
-  if (cx - LABEL_GAP - width >= plotLeft) {
-    return { x: cx - LABEL_GAP, anchor: 'end' };
-  }
-  // Too wide for either side: pin it inside the nearer edge.
-  return cx > (plotLeft + plotRight) / 2
-    ? { x: plotRight, anchor: 'end' }
-    : { x: plotLeft, anchor: 'start' };
-}
+  const ticks = [];
+  for (let v = min; v <= max; v++) ticks.push(v);
 
-export default function QuadrantChart({
-  means = [],
-  votes = [],
-  xLabel = 'X',
-  yLabel = 'Y',
-  scale = { min: 1, max: 10 },
-  midpoint = 5.5,
-  selectedId = null,
-  onSelect,
-  quadrantNames = {},
-}) {
-  const [hover, setHover] = useState(null);
+  // Place each label beside its dot, nudging apart the ones that would collide.
+  const placed = [];
+  const laidOut = [...points]
+    .sort((a, b) => sy(a.avgBenefit) - sy(b.avgBenefit))
+    .map((p) => {
+      const cx = sx(p.avgEffort);
+      const cy = sy(p.avgBenefit);
+      const text = p.title.length > 26 ? `${p.title.slice(0, 25)}\u2026` : p.title;
+      // Flip the label to the left when drawing it on the right would run past
+      // the plot frame. ~6.4px per character at 12.5px is close enough to place it.
+      const flip = cx + 16 + text.length * 6.4 > M.left + PLOT_W;
+      let ly = cy + 4;
+      while (placed.some((q) => Math.abs(q.ly - ly) < 13 && Math.abs(q.cx - cx) < 150)) ly += 13;
+      const item = { ...p, cx, cy, ly, flip, text };
+      placed.push(item);
+      return item;
+    });
 
-  const lo = scale.min - PAD;
-  const hi = scale.max + PAD;
-  const px = (v) => M.left + ((v - lo) / (hi - lo)) * PLOT.w;
-  const py = (v) => M.top + PLOT.h - ((v - lo) / (hi - lo)) * PLOT.h;
-
-  const ticks = useMemo(
-    () => Array.from({ length: scale.max - scale.min + 1 }, (_, i) => scale.min + i),
-    [scale.min, scale.max],
-  );
-
-  const meanLabels = useMemo(
-    () =>
-      deconflict(
-        means
-          .filter((m) => m.x != null && m.y != null)
-          .map((m) => ({
-            id: m.id,
-            text: m.label,
-            y: py(m.y) + 4,
-            ...placeLabel(m.label, px(m.x), M.left, M.left + PLOT.w),
-          })),
-      ),
-    [means, scale.min, scale.max],
-  );
-
-  const midX = px(midpoint);
-  const midY = py(midpoint);
+  const midX = sx(midpoint);
+  const midY = sy(midpoint);
 
   return (
     <div className="chart-wrap">
-      <svg
-        className="chart"
-        viewBox={`0 0 ${W} ${H}`}
-        role="img"
-        aria-label={`Scatter of strategies by ${xLabel} (horizontal) and ${yLabel} (vertical)`}
-        onMouseLeave={() => setHover(null)}
-      >
-        {/* Quadrant tints: the faintest possible cue, never a data colour. */}
-        <rect x={midX} y={M.top} width={M.left + PLOT.w - midX} height={midY - M.top}
-              fill="var(--series-1-soft)" opacity="0.5" />
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" role="img"
+           aria-label={`Benefit against effort for ${points.length} strategies`}
+           style={{ display: 'block', maxWidth: '100%' }}>
+        {/* quadrant tints: the two good corners lifted very slightly */}
+        <rect x={M.left} y={M.top} width={midX - M.left} height={midY - M.top}
+              fill="var(--accent)" opacity="0.05" />
+        <rect x={midX} y={midY} width={M.left + PLOT_W - midX} height={M.top + PLOT_H - midY}
+              fill="var(--text-muted)" opacity="0.05" />
 
-        {/* Recessive hairline grid */}
-        {ticks.map((t) => (
-          <g key={`g${t}`}>
-            <line className="grid-line" x1={px(t)} y1={M.top} x2={px(t)} y2={M.top + PLOT.h} />
-            <line className="grid-line" x1={M.left} y1={py(t)} x2={M.left + PLOT.w} y2={py(t)} />
+        {ticks.map((v) => (
+          <g key={`g${v}`}>
+            <line x1={sx(v)} y1={M.top} x2={sx(v)} y2={M.top + PLOT_H}
+                  stroke="var(--border)" strokeWidth="1" />
+            <line x1={M.left} y1={sy(v)} x2={M.left + PLOT_W} y2={sy(v)}
+                  stroke="var(--border)" strokeWidth="1" />
+            <text x={sx(v)} y={M.top + PLOT_H + 20} textAnchor="middle"
+                  fontSize="12" fill="var(--text-muted)">{v}</text>
+            <text x={M.left - 12} y={sy(v) + 4} textAnchor="end"
+                  fontSize="12" fill="var(--text-muted)">{v}</text>
           </g>
         ))}
 
-        {/* Quadrant split */}
-        <line className="mid-line" x1={midX} y1={M.top} x2={midX} y2={M.top + PLOT.h} />
-        <line className="mid-line" x1={M.left} y1={midY} x2={M.left + PLOT.w} y2={midY} />
+        {/* the split that defines the quadrants */}
+        <line x1={midX} y1={M.top} x2={midX} y2={M.top + PLOT_H}
+              stroke="var(--border-strong)" strokeWidth="2" strokeDasharray="5 4" />
+        <line x1={M.left} y1={midY} x2={M.left + PLOT_W} y2={midY}
+              stroke="var(--border-strong)" strokeWidth="2" strokeDasharray="5 4" />
 
-        {QUADRANT_CAPTIONS.map((c) => (
-          <text
-            key={c.key}
-            className="quadrant-label"
-            textAnchor="middle"
-            x={M.left + PLOT.w * c.xf}
-            y={c.edge === 'top' ? M.top - 13 : M.top + PLOT.h + 36}
-          >
-            {quadrantNames[c.key] ?? ''}
+        <rect x={M.left} y={M.top} width={PLOT_W} height={PLOT_H}
+              fill="none" stroke="var(--border-strong)" strokeWidth="1" />
+
+        {CORNERS.map((c) => (
+          <text key={c.key}
+                x={c.x === 'left' ? M.left + 12 : M.left + PLOT_W - 12}
+                y={c.y === 'top' ? M.top + 20 : M.top + PLOT_H - 10}
+                textAnchor={c.x === 'left' ? 'start' : 'end'}
+                fontSize="12" fontWeight="600" fill="var(--text-muted)"
+                letterSpacing="0.04em" style={{ textTransform: 'uppercase' }}>
+            {c.label}
           </text>
         ))}
 
-        {/* Frame + ticks */}
-        <rect className="axis-line" x={M.left} y={M.top} width={PLOT.w} height={PLOT.h} fill="none" />
-        {ticks.map((t) => (
-          <g key={`t${t}`}>
-            <text className="tick-label" x={px(t)} y={M.top + PLOT.h + 16} textAnchor="middle">{t}</text>
-            <text className="tick-label" x={M.left - 9} y={py(t) + 3.5} textAnchor="end">{t}</text>
+        <text x={M.left + PLOT_W / 2} y={H - 12} textAnchor="middle"
+              fontSize="13" fontWeight="600" fill="var(--text-secondary)">
+          Average effort &rarr;
+        </text>
+        <text x={16} y={M.top + PLOT_H / 2} textAnchor="middle" fontSize="13" fontWeight="600"
+              fill="var(--text-secondary)" transform={`rotate(-90 16 ${M.top + PLOT_H / 2})`}>
+          Average benefit &rarr;
+        </text>
+
+        {laidOut.map((p) => (
+          <g key={p.id}
+             onMouseEnter={() => setHovered(p)}
+             onMouseLeave={() => setHovered(null)}
+             style={{ cursor: 'default' }}>
+            {/* a generous invisible hit target around a deliberately small mark */}
+            <circle cx={p.cx} cy={p.cy} r="20" fill="transparent" />
+            <line x1={p.cx} y1={p.cy} x2={p.flip ? p.cx - 13 : p.cx + 13} y2={p.ly - 4}
+                  stroke="var(--border-strong)" strokeWidth="1" />
+            <circle cx={p.cx} cy={p.cy} r="9"
+                    fill="var(--accent)" stroke="var(--surface-1)" strokeWidth="2"
+                    opacity={hovered && hovered.id !== p.id ? 0.45 : 1} />
+            <text x={p.flip ? p.cx - 16 : p.cx + 16} y={p.ly}
+                  textAnchor={p.flip ? 'end' : 'start'}
+                  fontSize="12.5" fill="var(--text-primary)"
+                  opacity={hovered && hovered.id !== p.id ? 0.45 : 1}>
+              {p.text}
+            </text>
           </g>
-        ))}
-        <text className="axis-title" x={M.left + PLOT.w / 2} y={H - 10} textAnchor="middle">
-          {xLabel} &rarr;
-        </text>
-        <text
-          className="axis-title"
-          transform={`translate(15 ${M.top + PLOT.h / 2}) rotate(-90)`}
-          textAnchor="middle"
-        >
-          {yLabel} &rarr;
-        </text>
-
-        {/* Layer 1: individual votes for the selected strategy. Anonymous --
-            a dot carries a count, never a name. */}
-        {votes.map((v) => {
-          const r = 5 + 2.4 * Math.sqrt(Math.max(0, v.count - 1));
-          return (
-            <g key={`v${v.x}-${v.y}`}>
-              <circle
-                cx={px(v.x)} cy={py(v.y)} r={r}
-                fill="var(--series-1)" fillOpacity="0.22"
-                stroke="var(--series-1)" strokeWidth="1.5"
-              />
-              <circle
-                className="dot-hit" cx={px(v.x)} cy={py(v.y)} r={Math.max(r + 6, 12)}
-                onMouseEnter={() =>
-                  setHover({
-                    x: px(v.x), y: py(v.y),
-                    title: `${v.count} ${v.count === 1 ? 'vote' : 'votes'} here`,
-                    lines: [`${xLabel}: ${v.x}`, `${yLabel}: ${v.y}`],
-                  })
-                }
-              />
-            </g>
-          );
-        })}
-
-        {/* Layer 2: strategy averages */}
-        {means
-          .filter((m) => m.x != null && m.y != null)
-          .map((m) => {
-            const isSelected = m.id === selectedId;
-            return (
-              <g key={m.id}>
-                {m.contested && (
-                  <circle
-                    cx={px(m.x)} cy={py(m.y)} r="13"
-                    fill="none" stroke="var(--series-2)" strokeWidth="1.5" strokeDasharray="3 3"
-                  />
-                )}
-                {/* 2px surface ring keeps overlapping dots legible */}
-                <circle
-                  cx={px(m.x)} cy={py(m.y)} r={isSelected ? 8.5 : 7}
-                  fill="var(--series-1)" stroke="var(--surface-1)" strokeWidth="2"
-                />
-                <circle
-                  className="dot-hit" cx={px(m.x)} cy={py(m.y)} r="16"
-                  onMouseEnter={() =>
-                    setHover({
-                      x: px(m.x), y: py(m.y),
-                      title: m.label,
-                      lines: [
-                        `${xLabel}: ${m.x.toFixed(1)}`,
-                        `${yLabel}: ${m.y.toFixed(1)}`,
-                        `${m.voteCount} ${m.voteCount === 1 ? 'vote' : 'votes'}`,
-                        ...(m.contested ? ['Room is split on this one'] : []),
-                      ],
-                    })
-                  }
-                  onClick={() => onSelect?.(m.id)}
-                />
-              </g>
-            );
-          })}
-
-        {/* Direct labels -- sparing by design: one per strategy, no per-point values */}
-        {meanLabels.map((l) => (
-          <text
-            key={l.id}
-            className="point-label"
-            x={l.x}
-            y={l.y}
-            textAnchor={l.anchor}
-            opacity={selectedId && selectedId !== l.id ? 0.55 : 1}
-          >
-            {l.text}
-          </text>
         ))}
       </svg>
 
-      {hover && (
-        <div
-          className="tooltip"
-          style={{
-            left: `${(hover.x / W) * 100}%`,
-            top: `${(hover.y / H) * 100}%`,
-            transform: hover.x > W * 0.65 ? 'translate(-105%, -50%)' : 'translate(14px, -50%)',
-          }}
-        >
-          <div className="t-title">{hover.title}</div>
-          {hover.lines.map((line) => (
-            <div key={line} className="muted">{line}</div>
-          ))}
+      {hovered && (
+        <div className="chart-tooltip"
+             style={{
+               left: `${((hovered.cx + (hovered.flip ? -24 : 24)) / W) * 100}%`,
+               top: `${(hovered.cy / H) * 100}%`,
+               transform: hovered.flip ? 'translate(-100%, -50%)' : 'translate(0, -50%)',
+             }}>
+          <strong>{hovered.title}</strong>
+          <div className="secondary small">
+            Benefit {hovered.avgBenefit.toFixed(1)} &middot; Effort {hovered.avgEffort.toFixed(1)}
+          </div>
+          <div className="muted small">
+            {hovered.rated} rated
+            {hovered.notSure > 0 ? `, ${hovered.notSure} not sure` : ''}
+            {' '}({hovered.responded} responded)
+          </div>
         </div>
       )}
     </div>
