@@ -28,7 +28,7 @@ npm test        # 31 tests, no database or server setup needed
 | Variable | Default | Notes |
 |---|---|---|
 | `ADMIN_PASSCODE` | `let-me-in` | **Set this.** The server warns while the default is in use. |
-| `DATABASE_URL` | — | Hosted Postgres. **Required when deployed**; without it the app runs on an embedded database. |
+| `DATABASE_URL` | — | Hosted Postgres (`POSTGRES_URL` is also accepted). **Required when deployed**; without it the app runs on an embedded database. |
 | `DB_DIR` | — | Local PGlite data directory. Unset = in-memory (data lost on restart). |
 | `PORT` | `3001` | |
 

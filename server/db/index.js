@@ -15,15 +15,24 @@ export const DEFAULT_SESSION_ID = 'default';
  * Both speak the same SQL and the same `$1` placeholders, so there is no
  * dialect fork anywhere above this file.
  */
+/**
+ * Hosted-Postgres integrations disagree on the variable name: Neon and most
+ * providers set DATABASE_URL, Vercel Postgres sets POSTGRES_URL. Accept either
+ * so a correctly provisioned database is never missed over a naming detail.
+ */
+export function databaseUrl() {
+  return process.env.DATABASE_URL || process.env.POSTGRES_URL || null;
+}
+
 async function createDriver() {
-  const url = process.env.DATABASE_URL;
+  const url = databaseUrl();
 
   // PGlite is per-process and (without DB_DIR) in-memory. On a serverless host
   // that means every lambda gets its own empty database and participants see
   // each other's data vanish at random. Fail loudly instead of half-working.
   if (!url && process.env.VERCEL) {
     throw new Error(
-      'DATABASE_URL is not set. A serverless deployment needs a hosted Postgres -- ' +
+      'No DATABASE_URL (or POSTGRES_URL). A serverless deployment needs a hosted Postgres -- ' +
       'add one in the Vercel dashboard (Storage -> Postgres) and redeploy.',
     );
   }
